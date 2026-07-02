@@ -9,7 +9,7 @@ toward POSIX-like behavior over time -- one milestone at a time,
 starting from a kernel that boots, logs, and doesn't lie to you when it
 crashes.
 
-## Milestone 0: Cold Boot (current)
+## Milestone 0: Cold Boot
 
 Goal: power on in QEMU -> our own hand-written UEFI bootloader finds and
 loads the kernel -> the kernel proves it's alive on serial and the
@@ -30,9 +30,26 @@ framebuffer -> a real panic path -> fully scriptable dev loop.
   Tests are scriptable via QEMU's isa-debug-exit device -- no human
   needs to watch the VM to know if a boot succeeded.
 
-Not yet: memory allocator, interrupts, scheduler, processes, syscalls,
-a filesystem, or a shell. Those are later milestones, each starting
-from this same "boots and can't hide a bug" foundation.
+## Milestone 1: Physical Memory (current)
+
+Goal: a physical page allocator built from the UEFI memory map the
+bootloader already hands off.
+
+- **`kernel/src/pmm.c`**: a flat bitmap over physical RAM, one bit per
+  4 KiB page. Only `EfiConventionalMemory` and `EfiBootServices{Code,Data}`
+  regions are treated as allocatable; everything else (including
+  firmware's oversized reserved/MMIO windows, which can sit at physical
+  addresses with nothing to do with actual installed RAM) stays
+  permanently marked used. `pmm_alloc_page()` / `pmm_free_page()` hand
+  out and reclaim physical pages; there's no virtual memory yet, so
+  physical and virtual addresses still coincide under UEFI's identity
+  map.
+- Test mode exercises the allocator: distinct pages, independently
+  writable, freed pages become reusable again.
+
+Not yet: virtual memory, a heap, interrupts, scheduler, processes,
+syscalls, a filesystem, or a shell. Those are later milestones, each
+starting from this same "boots and can't hide a bug" foundation.
 
 ## Building
 
