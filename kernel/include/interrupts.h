@@ -16,12 +16,14 @@ typedef struct {
     uint64_t rip, cs, rflags;
 } interrupt_frame_t;
 
-#define IDT_VECTOR_COUNT 33 /* CPU exceptions 0-31, plus IRQ0 (timer) at 32 */
+#define IDT_VECTOR_COUNT 34 /* CPU exceptions 0-31, IRQ0 (timer)=32, IRQ1 (keyboard)=33 */
 
 void idt_init(void);
 
-/* Lets timer.c (or later, other device drivers) claim vectors >= 32
- * without idt.c needing to know anything about the PIC. */
-void idt_set_irq_handler(void (*handler)(interrupt_frame_t *frame));
+/* Lets device drivers (timer.c, keyboard.c, ...) claim their own IRQ
+ * line without idt.c needing to know anything about the PIC or any
+ * particular device -- `irq` is the PIC-relative line number (0 for
+ * the timer, 1 for the keyboard, etc.), not the raw IDT vector. */
+void idt_set_irq_handler(uint8_t irq, void (*handler)(interrupt_frame_t *frame));
 
 #endif /* REBORNOS_INTERRUPTS_H */

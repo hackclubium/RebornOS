@@ -7,6 +7,9 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "elf_loader.h"
+#include "keyboard.h"
+#include "process.h"
+#include "vfs.h"
 
 volatile uint64_t syscall_write_count = 0;
 
@@ -69,28 +72,54 @@ void syscall_dispatch(interrupt_frame_t *frame) {
         case SYS_EXIT:
             /* A nonzero code means the caller is self-reporting a
              * failed check (see kmain.c's isolation test processes) --
-             * there's no per-process fault containment yet (that needs
-             * the same thread-removal mechanism noted below), so the
+             * there's still no per-process fault containment, so the
              * most honest thing to do is panic loudly rather than
-             * quietly swallow a reported failure. */
+             * quietly swallow a reported failure. A clean exit now
+             * really ends the thread (see thread_exit()) instead of
+             * yielding forever in place. */
             if ((int64_t)frame->rdi != 0) {
                 panic("syscall_dispatch: user thread reported failure, exit code %ld",
                       (int64_t)frame->rdi);
             }
+            kprintf("syscall: thread exited with code 0\n");
+            thread_exit();
+            break; /* unreachable -- thread_exit() never returns */
 
-            /* We're inside an interrupt gate (IF=0), so looping on hlt
-             * here would freeze the entire system forever, not just
-             * this thread -- nothing could ever interrupt us again.
-             * Our minimal scheduler has no way to remove a thread from
-             * the round-robin, so instead this thread "exits" by
-             * voluntarily yielding every time it gets a turn, forever.
-             * A real thread-exit would deallocate its stack and remove
-             * it from the ready queue entirely. */
-            kprintf("syscall: user thread exited with code 0\n");
-            for (;;) {
+        case SYS_READ_CHAR: {
+            int c;
+            __asm__ volatile("sti");
+            while ((c = keyboard_read_char()) < 0) {
                 schedule();
             }
+            frame->rax = (uint64_t)(int64_t)c;
             break;
+        }
+
+        case SYS_EXEC: {
+            if (!user_ptr_valid((const void *)frame->rdi, 64)) {
+                panic("syscall_dispatch: SYS_EXEC got an invalid pointer 0x%lx", frame->rdi);
+            }
+            const char *user_name = (const char *)frame->rdi;
+            char name[64];
+            uint32_t i = 0;
+            for (; i < sizeof(name) - 1 && user_name[i] != '\0'; i++) {
+                name[i] = user_name[i];
+            }
+            name[i] = '\0';
+
+            __asm__ volatile("sti");
+            frame->rax = (uint64_t)(int64_t)process_spawn_and_wait(name, "exec");
+            break;
+        }
+
+        case SYS_LIST_ROOT: {
+            if (!user_ptr_valid((const void *)frame->rdi, frame->rsi)) {
+                panic("syscall_dispatch: SYS_LIST_ROOT got an invalid buffer 0x%lx (len %lu)",
+                      frame->rdi, frame->rsi);
+            }
+            frame->rax = vfs_list_root((char *)frame->rdi, (uint32_t)frame->rsi);
+            break;
+        }
 
         default:
             panic("syscall_dispatch: unknown syscall number %lu", frame->rax);

@@ -1,7 +1,7 @@
 /* RebornOS's first real userland program: a separate ELF64 executable,
  * built with our own cross-compiler and linked to run at
  * ELF_USER_LOAD_BASE (see kernel/include/elf_loader.h), staged onto the
- * ESP as INIT.ELF, and loaded off a real FAT32 filesystem by the
+ * ESP as INIT.ELF, and loaded off a real FAT16 filesystem by the
  * kernel's VFS + ELF loader rather than being baked into the kernel
  * image. No libc, no crt0 -- enter_usermode() already leaves the stack
  * set up (see elf_loader.c), so _start can just be an ordinary C
@@ -26,6 +26,6 @@ static inline void sys_exit(long code) {
 }
 
 void _start(void) {
-    sys_write("init: loaded from disk via FAT32 + ELF loader\n");
+    sys_write("init: loaded from disk via FAT16 + ELF loader\n");
     sys_exit(0);
 }

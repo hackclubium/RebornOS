@@ -17,4 +17,10 @@ uint64_t timer_ticks(void);
  * needing to know it exists. */
 void timer_set_tick_callback(void (*callback)(void));
 
+/* PIC primitives every IRQ-driven device needs, not just the timer --
+ * exposed here because timer.c is the module that already owns PIC
+ * initialization. `irq` is the PIC-relative line number (0-15). */
+void pic_send_eoi(uint8_t irq);
+void pic_unmask_irq(uint8_t irq);
+
 #endif /* REBORNOS_TIMER_H */

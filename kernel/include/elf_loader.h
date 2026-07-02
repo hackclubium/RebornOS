@@ -35,4 +35,10 @@ typedef struct {
  * recover from gracefully. */
 void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t pml4_phys, elf_process_t *out);
 
+/* Thread entry point for a freshly spawned process (see process.h):
+ * takes ownership of `arg` (an elf_process_t* from
+ * elf_load_user_program(), heap-allocated by the caller -- freed here),
+ * drops into ring 3 at its entry point, and never returns. */
+__attribute__((noreturn)) void elf_launch_process(void *arg);
+
 #endif /* REBORNOS_ELF_LOADER_H */

@@ -45,7 +45,7 @@ $(BOOT_EFI): $(BOOT_OBJS)
 # ---------------------------------------------------------------------
 
 KERNEL_OBJDIR := $(BUILD)/kernel
-KERNEL_SRCS   := entry.S kmain.c serial.c minilib.c framebuffer.c font8x8.c panic.c kprintf.c qemu_debug.c pmm.c vmm.c isr_stubs.S idt.c timer.c heap.c scheduler.c context_switch.S gdt.c gdt_asm.S syscall.c fat16.c vfs.c elf_loader.c
+KERNEL_SRCS   := entry.S kmain.c serial.c minilib.c framebuffer.c font8x8.c panic.c kprintf.c qemu_debug.c pmm.c vmm.c isr_stubs.S idt.c timer.c heap.c scheduler.c context_switch.S gdt.c gdt_asm.S syscall.c fat16.c vfs.c elf_loader.c process.c keyboard.c
 KERNEL_OBJS   := $(addprefix $(KERNEL_OBJDIR)/,$(patsubst %.S,%.o,$(patsubst %.c,%.o,$(KERNEL_SRCS))))
 KERNEL_ELF    := $(BUILD)/kernel.elf
 
@@ -86,16 +86,18 @@ $(KERNEL_TEST_ELF): $(KERNEL_TEST_OBJS)
 	$(KCC) $(KLDFLAGS) -o $@ $(KERNEL_TEST_OBJS)
 
 # ---------------------------------------------------------------------
-# Userland (ELF64 user program, built with our own cross-compiler, no
-# libc -- raw int $0x80 syscalls, staged onto the ESP and loaded by the
-# kernel's VFS + FAT32 + ELF loader instead of being baked into the
-# kernel image).
+# Userland (ELF64 user programs, built with our own cross-compiler, no
+# libc -- raw int $0x80 syscalls, each staged onto the ESP as its own
+# file and loaded by the kernel's VFS + FAT16 + ELF loader instead of
+# being baked into the kernel image). Each name in USER_PROGRAMS is a
+# separate, independently linked executable -- add a name here and drop
+# a matching userland/<name>.c to ship a new program.
 # ---------------------------------------------------------------------
 
-USER_OBJDIR := $(BUILD)/userland
-USER_SRCS   := init.c
-USER_OBJS   := $(addprefix $(USER_OBJDIR)/,$(USER_SRCS:.c=.o))
-USER_ELF    := $(BUILD)/init.elf
+USER_PROGRAMS := init shell
+USER_OBJDIR   := $(BUILD)/userland
+USER_OBJS     := $(addprefix $(USER_OBJDIR)/,$(addsuffix .o,$(USER_PROGRAMS)))
+USER_ELFS     := $(addprefix $(BUILD)/,$(addsuffix .elf,$(USER_PROGRAMS)))
 
 # -mcmodel=large: ELF_USER_LOAD_BASE (0x8000400000, ~512 GiB) is way
 # past the small code model's assumption that everything fits in the
@@ -111,8 +113,8 @@ $(USER_OBJDIR)/%.o: userland/%.c | $(USER_OBJDIR)
 $(USER_OBJDIR):
 	mkdir -p $@
 
-$(USER_ELF): $(USER_OBJS)
-	$(KCC) $(ULDFLAGS) -o $@ $(USER_OBJS)
+$(BUILD)/%.elf: $(USER_OBJDIR)/%.o
+	$(KCC) $(ULDFLAGS) -o $@ $<
 
 # ---------------------------------------------------------------------
 # ESP staging directories, booted via QEMU's VVFAT driver
@@ -125,12 +127,12 @@ ESP_STAMP     := $(ESP_DIR)/.stamp
 ESP_TEST_DIR  := $(BUILD)/esp-test
 ESP_TEST_STAMP := $(ESP_TEST_DIR)/.stamp
 
-$(ESP_STAMP): $(BOOT_EFI) $(KERNEL_ELF) $(USER_ELF)
-	bash tools/mkimage.sh $(ESP_DIR) $(BOOT_EFI) $(KERNEL_ELF) $(USER_ELF)
+$(ESP_STAMP): $(BOOT_EFI) $(KERNEL_ELF) $(USER_ELFS)
+	bash tools/mkimage.sh $(ESP_DIR) $(BOOT_EFI) $(KERNEL_ELF) $(USER_ELFS)
 	touch $@
 
-$(ESP_TEST_STAMP): $(BOOT_EFI) $(KERNEL_TEST_ELF) $(USER_ELF)
-	bash tools/mkimage.sh $(ESP_TEST_DIR) $(BOOT_EFI) $(KERNEL_TEST_ELF) $(USER_ELF)
+$(ESP_TEST_STAMP): $(BOOT_EFI) $(KERNEL_TEST_ELF) $(USER_ELFS)
+	bash tools/mkimage.sh $(ESP_TEST_DIR) $(BOOT_EFI) $(KERNEL_TEST_ELF) $(USER_ELFS)
 	touch $@
 
 # ---------------------------------------------------------------------

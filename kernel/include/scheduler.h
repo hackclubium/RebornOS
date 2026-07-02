@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define SCHEDULER_MAX_THREADS 8u
+#define SCHEDULER_MAX_THREADS 16u
 #define SCHEDULER_STACK_SIZE (16u * 1024u)
 
 /* Simple preemptive round-robin scheduler over a fixed table of kernel
@@ -30,9 +30,22 @@ int thread_create_process(const char *name, void (*entry)(void), uint64_t cr3);
  * rather than a dedicated static launcher per program. */
 int thread_create_process_arg(const char *name, void (*entry)(void *arg), void *arg, uint64_t cr3);
 
-/* Round-robins to the next ready thread. A no-op with 0 or 1 threads.
- * Safe to call from within the timer ISR's call chain. */
+/* Round-robins to the next ready thread. A no-op with 0 or 1 active
+ * threads. Safe to call from within the timer ISR's call chain. */
 void schedule(void);
+
+/* Ends the calling thread: marks its slot free for reuse and never
+ * returns to it. Its stack is freed once the scheduler has switched
+ * away from it (not before -- see the comment in schedule()). Replaces
+ * the "loop yielding forever" a thread used to do on exit now that the
+ * scheduler can actually remove a thread from the round-robin. */
+__attribute__((noreturn)) void thread_exit(void);
+
+/* True if `tid` (an id returned by one of the thread_create* functions)
+ * is still running. Lets a caller block until a spawned process
+ * finishes (see process_spawn_and_wait() in process.h) just by looping
+ * on this and schedule() -- no separate wait queue needed. */
+int thread_is_alive(int tid);
 
 /* Switches from the caller's context into the first thread and never
  * returns. Call once, after creating at least one thread. */

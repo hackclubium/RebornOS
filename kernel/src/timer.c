@@ -45,13 +45,29 @@ static void pic_remap(uint8_t offset1, uint8_t offset2) {
     outb(PIC2_DATA, ICW4_8086);
     io_wait();
 
-    /* Mask every IRQ except IRQ0 (timer) -- nothing else is driven yet. */
-    outb(PIC1_DATA, 0xFE);
+    /* Mask every IRQ to start with -- each driver unmasks its own line
+     * via pic_unmask_irq() once it's actually ready to handle it (see
+     * keyboard_init()). */
+    outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
 }
 
-static void pic_send_eoi(void) {
+/* PIC-level primitives shared by every IRQ-driven device, not just the
+ * timer -- they live here because timer.c is the module that already
+ * owns PIC initialization (pic_remap() above), not because they're
+ * timer-specific. */
+void pic_send_eoi(uint8_t irq) {
+    if (irq >= 8) {
+        outb(PIC2_COMMAND, PIC_EOI);
+    }
     outb(PIC1_COMMAND, PIC_EOI);
+}
+
+void pic_unmask_irq(uint8_t irq) {
+    uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
+    uint8_t line = (irq < 8) ? irq : (uint8_t)(irq - 8);
+    uint8_t mask = inb(port);
+    outb(port, (uint8_t)(mask & ~(1u << line)));
 }
 
 static void pit_set_frequency(uint32_t hz) {
@@ -64,7 +80,7 @@ static void pit_set_frequency(uint32_t hz) {
 static void timer_irq_handler(interrupt_frame_t *frame) {
     (void)frame;
     tick_count++;
-    pic_send_eoi();
+    pic_send_eoi(0);
     if (tick_callback != NULL) {
         tick_callback();
     }
@@ -73,7 +89,8 @@ static void timer_irq_handler(interrupt_frame_t *frame) {
 void timer_init(uint32_t hz) {
     pic_remap(TIMER_IRQ_VECTOR, TIMER_IRQ_VECTOR + 8);
     pit_set_frequency(hz);
-    idt_set_irq_handler(timer_irq_handler);
+    idt_set_irq_handler(0, timer_irq_handler);
+    pic_unmask_irq(0);
     __asm__ volatile("sti");
 }
 

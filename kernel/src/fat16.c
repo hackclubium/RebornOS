@@ -182,3 +182,42 @@ uint32_t fat16_read(const fat16_file_t *file, void *buf, uint32_t max_len) {
     }
     return total - remaining;
 }
+
+uint32_t fat16_list_root(char *buf, uint32_t max_len) {
+    uint32_t written = 0;
+    const uint8_t *root = sector_ptr(fs.root_dir_start_sector);
+
+    for (uint32_t e = 0; e < fs.root_dir_entry_count; e++) {
+        const fat16_dirent_t *de = (const fat16_dirent_t *)(root + e * sizeof(fat16_dirent_t));
+        if (de->name[0] == 0x00) {
+            break;
+        }
+        if (de->name[0] == 0xE5 || de->attr == ATTR_LONG_NAME || (de->attr & ATTR_VOLUME_ID)) {
+            continue;
+        }
+
+        char line[13]; /* 8 + '.' + 3 + '\n' */
+        uint32_t li = 0;
+        for (int i = 0; i < 8 && de->name[i] != ' '; i++) {
+            line[li++] = (char)de->name[i];
+        }
+        if (de->name[8] != ' ') {
+            line[li++] = '.';
+            for (int i = 8; i < 11 && de->name[i] != ' '; i++) {
+                line[li++] = (char)de->name[i];
+            }
+        }
+        line[li++] = '\n';
+
+        if (written + li >= max_len) {
+            break; /* leave room for the trailing NUL below */
+        }
+        memcpy(buf + written, line, li);
+        written += li;
+    }
+
+    if (max_len > 0) {
+        buf[written < max_len ? written : max_len - 1] = '\0';
+    }
+    return written;
+}

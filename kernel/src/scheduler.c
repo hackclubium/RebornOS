@@ -6,10 +6,18 @@
 #include "vmm.h"
 #include "gdt.h"
 
+typedef enum {
+    THREAD_UNUSED = 0, /* free slot -- available to thread_create_ex() */
+    THREAD_ACTIVE,
+    THREAD_ZOMBIE, /* thread_exit() was called; schedule() reaps it after switching away */
+} thread_state_t;
+
 typedef struct {
     uint64_t rsp;
     uint64_t cr3;
     uint64_t kernel_stack_top; /* becomes TSS.RSP0 while this thread runs -- see gdt.h */
+    uint8_t *stack_base;       /* the kmalloc() allocation kernel_stack_top points into, freed on exit */
+    thread_state_t state;
     char name[16];
 } thread_t;
 
@@ -17,17 +25,29 @@ extern void switch_context(uint64_t *old_rsp_ptr, uint64_t new_rsp);
 extern void thread_trampoline(void);
 
 static thread_t threads[SCHEDULER_MAX_THREADS];
-static unsigned int thread_count;
-static int current_thread = -1;   /* -1 == still on the boot stack, no thread running yet */
-static uint64_t boot_rsp_unused;  /* discard slot for the very first switch away from boot */
+static unsigned int active_count;
+static int current_thread = -1;  /* -1 == still on the boot stack, no thread running yet */
+static uint64_t discard_rsp;     /* scratch slot for a switch whose "previous" context is never resumed
+                                   * (the very first switch away from the boot stack, or a thread that
+                                   * just exited) */
 
 void scheduler_init(void) {
-    thread_count = 0;
+    for (unsigned int i = 0; i < SCHEDULER_MAX_THREADS; i++) {
+        threads[i].state = THREAD_UNUSED;
+    }
+    active_count = 0;
     current_thread = -1;
 }
 
 static int thread_create_ex(const char *name, void (*entry)(void), void *arg, uint64_t cr3) {
-    if (thread_count >= SCHEDULER_MAX_THREADS) {
+    int id = -1;
+    for (unsigned int i = 0; i < SCHEDULER_MAX_THREADS; i++) {
+        if (threads[i].state == THREAD_UNUSED) {
+            id = (int)i;
+            break;
+        }
+    }
+    if (id < 0) {
         panic("thread_create: too many threads (max %u)", SCHEDULER_MAX_THREADS);
     }
 
@@ -51,9 +71,9 @@ static int thread_create_ex(const char *name, void (*entry)(void), void *arg, ui
     sp[-6] = 0;                                       /* r14 */
     sp[-7] = 0;                                       /* r15 */
 
-    unsigned int id = thread_count++;
     threads[id].rsp = (uint64_t)(uintptr_t)&sp[-7];
     threads[id].cr3 = cr3;
+    threads[id].stack_base = stack;
     /* Reusing the same allocation as both this thread's kernel-mode
      * stack (used by thread_trampoline/entry while it's not yet in
      * ring 3) and its TSS.RSP0 landing stack (used if/when it later
@@ -61,6 +81,8 @@ static int thread_create_ex(const char *name, void (*entry)(void), void *arg, ui
      * doing both at once, so nothing is ever live in both roles
      * simultaneously. */
     threads[id].kernel_stack_top = (uint64_t)(uintptr_t)(stack + SCHEDULER_STACK_SIZE);
+    threads[id].state = THREAD_ACTIVE;
+    active_count++;
 
     unsigned int i = 0;
     for (; name[i] != '\0' && i < sizeof(threads[id].name) - 1; i++) {
@@ -68,7 +90,7 @@ static int thread_create_ex(const char *name, void (*entry)(void), void *arg, ui
     }
     threads[id].name[i] = '\0';
 
-    return (int)id;
+    return id;
 }
 
 int thread_create(const char *name, void (*entry)(void)) {
@@ -88,29 +110,98 @@ int thread_create_process_arg(const char *name, void (*entry)(void *arg), void *
     return thread_create_ex(name, (void (*)(void))(uintptr_t)entry, arg, cr3);
 }
 
+/* Finds the next ACTIVE slot after `start`, wrapping all the way
+ * around the table. With active_count > 1 (the only case schedule()
+ * calls this in) this always finds something -- worst case, wrapping
+ * all the way back to `start` itself if nothing else is active, though
+ * that would mean active_count's bookkeeping is wrong somewhere. */
+static int next_active_after(int start) {
+    for (unsigned int i = 1; i <= SCHEDULER_MAX_THREADS; i++) {
+        int idx = (start + (int)i) % (int)SCHEDULER_MAX_THREADS;
+        if (idx < 0) {
+            idx += (int)SCHEDULER_MAX_THREADS;
+        }
+        if (threads[idx].state == THREAD_ACTIVE) {
+            return idx;
+        }
+    }
+    return -1;
+}
+
 void schedule(void) {
-    if (thread_count <= 1) {
+    /* This whole function must run atomically. In particular, a timer
+     * IRQ landing between kfree(prev's stack) and switch_context()
+     * below would recursively re-enter schedule() *on top of that same
+     * stack* (an interrupt doesn't switch stacks within the same ring),
+     * see the zombie-reaping branch further down for the corrupted-rsp
+     * consequences of getting this wrong. Restored implicitly whenever
+     * whichever thread runs next takes its own interrupt/syscall round
+     * trip back out through iretq -- same as every other place in this
+     * kernel that leaves IF=0 across a context switch. */
+    __asm__ volatile("cli");
+
+    if (active_count <= 1) {
         return;
     }
 
     int prev = current_thread;
-    int next = (prev + 1) % (int)thread_count;
+    int next = next_active_after(prev);
+    if (next < 0) {
+        return; /* shouldn't happen given active_count > 1, but don't switch into nothing */
+    }
     current_thread = next;
 
     vmm_load_cr3(threads[next].cr3);
     tss_set_kernel_stack(threads[next].kernel_stack_top);
 
-    uint64_t *old_rsp_slot = (prev == -1) ? &boot_rsp_unused : &threads[prev].rsp;
-    switch_context(old_rsp_slot, threads[next].rsp);
+    if (prev == -1) {
+        switch_context(&discard_rsp, threads[next].rsp);
+        return;
+    }
+
+    if (threads[prev].state == THREAD_ZOMBIE) {
+        /* prev is exiting and will never be resumed. Freeing its stack
+         * here, before switch_context, is safe even though we're still
+         * physically executing on that stack's memory: freeing just
+         * marks the heap block free in the free-list, it doesn't
+         * invalidate the underlying physical page, and nothing else
+         * can touch that block before switch_context changes rsp on
+         * the very next line, since we hold the CPU the whole time. */
+        kfree(threads[prev].stack_base);
+        threads[prev].state = THREAD_UNUSED;
+        active_count--;
+        switch_context(&discard_rsp, threads[next].rsp);
+        return;
+    }
+
+    switch_context(&threads[prev].rsp, threads[next].rsp);
+}
+
+__attribute__((noreturn)) void thread_exit(void) {
+    if (current_thread < 0) {
+        panic("thread_exit: called with no current thread");
+    }
+    threads[current_thread].state = THREAD_ZOMBIE;
+    schedule();
+    panic("thread_exit: schedule() returned into an exited thread");
+}
+
+int thread_is_alive(int tid) {
+    if (tid < 0 || tid >= (int)SCHEDULER_MAX_THREADS) {
+        return 0;
+    }
+    return threads[tid].state == THREAD_ACTIVE;
 }
 
 void scheduler_start(void) {
-    if (thread_count == 0) {
+    __asm__ volatile("cli"); /* same reasoning as schedule()'s -- keep the switch atomic */
+    if (active_count == 0) {
         panic("scheduler_start: no threads created");
     }
-    current_thread = 0;
-    vmm_load_cr3(threads[0].cr3);
-    tss_set_kernel_stack(threads[0].kernel_stack_top);
-    switch_context(&boot_rsp_unused, threads[0].rsp);
+    int first = next_active_after(-1);
+    current_thread = first;
+    vmm_load_cr3(threads[first].cr3);
+    tss_set_kernel_stack(threads[first].kernel_stack_top);
+    switch_context(&discard_rsp, threads[first].rsp);
     panic("scheduler_start: switch_context returned to the boot stack unexpectedly");
 }

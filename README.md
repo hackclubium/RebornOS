@@ -173,7 +173,7 @@ baked into the kernel image, not something loaded from disk. Those are
 later milestones, each starting from this same "boots and can't hide a
 bug" foundation.
 
-## Milestone 5: Disk-Loaded Programs (current)
+## Milestone 5: Disk-Loaded Programs
 
 Goal: a "process" stops being a C function compiled into the kernel's
 own binary and becomes an actual file, found and loaded off a real
@@ -256,6 +256,80 @@ still reads the whole volume into RAM via UEFI's `BLOCK_IO` before
 OS talks to a real disk), or a shell to launch programs interactively
 instead of `kmain.c` hardcoding which ones to run. Those are next.
 
+## Milestone 6: Interactive Shell (current)
+
+Goal: a human can actually type at RebornOS. Every milestone before
+this one was fully scripted -- the kernel deciding on its own what to
+run, when -- because there was no input device at all. This is the
+first time that changes.
+
+- **`kernel/src/keyboard.c`**: a PS/2 keyboard driver. IRQ1, US QWERTY,
+  scancode set 1 (what the i8042 controller normalizes every keyboard
+  down to). Lowercase only -- Shift/Ctrl/Alt are recognized just enough
+  to be ignored rather than corrupting the output, which is enough to
+  type a filename (`fat16.c` uppercases everything when matching
+  anyway) and run `ls`; real shifted/symbol input is future work.
+  Required generalizing `idt_set_irq_handler()` from a single global
+  callback (only the timer ever used it) into a small table indexed by
+  IRQ line, and exposing the PIC's EOI/unmask primitives from
+  `timer.c` (which already owned PIC init from Milestone 2) so a second
+  device can use them too.
+- **Real thread exit** (`kernel/src/scheduler.c`): every process before
+  this milestone "exited" by yielding forever in an infinite loop --
+  documented since Milestone 3 as a stopgap because the scheduler had
+  no way to actually remove a thread. `thread_exit()` now really does:
+  each thread slot gets a state (`ACTIVE`/`ZOMBIE`/`UNUSED`), and
+  `schedule()` frees a zombie's stack and frees its slot for reuse right
+  after switching away from it. `SYS_EXIT` calls it instead of looping.
+- **`kernel/src/process.c`**: `process_spawn()` and
+  `process_spawn_and_wait()` tie the VFS, ELF loader, and scheduler
+  together into "run this program from disk," used by booting the
+  shell, the new `SYS_EXEC` syscall, and a self-test. Waiting for a
+  spawned program needs no new synchronization primitive -- it's just a
+  loop checking `thread_is_alive()` and calling `schedule()`, the same
+  cooperative round-robin every thread already participates in.
+- **Three new syscalls** (`kernel/src/syscall.c`): `SYS_READ_CHAR`
+  (blocks -- cooperatively -- until a keystroke is available),
+  `SYS_EXEC` (loads a program by name and blocks until it exits, so a
+  shell doesn't need its own wait/fork logic), and `SYS_LIST_ROOT`
+  (fills a buffer with the root directory's filenames, for `ls`).
+- **`userland/shell.c`**: RebornOS's actual shell. A real ELF64
+  executable, loaded off disk exactly like `INIT.ELF`, no libc. Prints
+  a prompt, reads a line with backspace handling and per-character
+  echo, treats `ls` as a builtin, and hands anything else to `SYS_EXEC`
+  as a program name.
+- The Makefile's userland section now builds a *list* of programs
+  (`init`, `shell`), each its own independently linked ELF staged onto
+  the ESP as its own uppercased 8.3 name -- adding a new userland
+  program going forward means one line in `Makefile` and one `.c` file.
+- A real, if narrow, concurrency bug this milestone caught: `thread_exit()`
+  used to `sti` (re-enable interrupts) right before yielding away for
+  the last time, so that the system wouldn't stay permanently
+  interrupt-disabled if every other thread was cooperatively yielding
+  instead of relying on the timer. But that opened a window: if a timer
+  IRQ landed between `schedule()` freeing the exiting thread's stack and
+  actually switching away from it, the IRQ handler would recursively
+  re-enter `schedule()` *on top of that same about-to-be-abandoned
+  stack*, corrupting whatever thread got switched away from inside that
+  nested call -- surfacing as a `make test` failure roughly one run in
+  six, always an Invalid Opcode fault at some near-zero garbage `rip`.
+  Fixed by making `schedule()`'s whole body atomic (`cli` on entry)
+  instead of trying to keep interrupts enabled across it.
+- Test mode covers the new pieces without needing a real keystroke:
+  `keyboard_inject_char()` feeds the ring buffer directly to test the
+  buffer + translation path, and a plain kernel thread calls
+  `process_spawn_and_wait()` on `INIT.ELF` to exercise the exact
+  mechanism `SYS_EXEC` uses (and to double as a `thread_exit()`
+  exercise) -- both deterministic, neither needing a human at the
+  keyboard. The real shell, with real typed input, is verified via
+  `make run`.
+
+Not yet: Shift/symbol input, command history, arguments (a shell
+command is just a bare program name -- no `ls -l`-style parsing),
+piping/redirection, or running more than one foreground program at a
+time. Those, plus real disk drivers and subdirectories from Milestone
+5's list, are all still ahead.
+
 ## Building
 
 Everything here runs inside WSL2 (or native Linux) -- the toolchains
@@ -300,10 +374,12 @@ The kernel provides sharp primitives; userspace builds the actual
 world. Roadmap so far: physical memory allocator -> virtual memory /
 heap -> interrupts & timers -> scheduler -> user mode & syscalls ->
 per-process address space isolation -> VFS + a FAT16 filesystem + an
-ELF loader for real disk-loaded programs (done). Next: a shell, so
-programs get launched by typing their name instead of `kmain.c`
-hardcoding which ones to run. GUI, networking, package managers, and
-Linux binary compatibility are deliberately out of scope until there's
-a command-line system that
+ELF loader for real disk-loaded programs -> a keyboard driver, real
+thread exit, and an interactive shell (done). Next: a real disk driver
+(AHCI/NVMe, replacing the "read the whole volume into RAM at boot"
+approach), subdirectories, and a bigger syscall surface (arguments,
+piping) as programs get more ambitious. GUI, networking, package
+managers, and Linux binary compatibility are deliberately out of scope
+until there's a command-line system that
 boots reliably, manages memory correctly, runs isolated programs, and
 touches files.

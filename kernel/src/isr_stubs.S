@@ -60,8 +60,10 @@ ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
 
-/* IRQ0 (timer), remapped to vector 32 -- see pic_remap() in timer.c */
+/* IRQ0 (timer) and IRQ1 (keyboard), remapped to vectors 32/33 -- see
+ * pic_remap() in timer.c */
 ISR_NOERR 32
+ISR_NOERR 33
 
 /* Syscall vector (int $0x80). Deliberately NOT added to isr_stub_table
  * below (that table is sized/indexed for vectors 0-32 only) -- idt.c
@@ -146,3 +148,4 @@ isr_stub_table:
     .quad isr_stub_30
     .quad isr_stub_31
     .quad isr_stub_32
+    .quad isr_stub_33

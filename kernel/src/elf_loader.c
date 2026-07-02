@@ -5,6 +5,8 @@
 #include "pmm.h"
 #include "panic.h"
 #include "minilib.h"
+#include "gdt.h"
+#include "heap.h"
 
 static uint64_t page_align_down(uint64_t x) {
     return x & ~(uint64_t)(PMM_PAGE_SIZE - 1);
@@ -86,4 +88,13 @@ void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t 
 
     out->entry = ehdr->e_entry;
     out->stack_top = ELF_USER_STACK_TOP;
+}
+
+__attribute__((noreturn)) void elf_launch_process(void *arg) {
+    elf_process_t *proc = (elf_process_t *)arg;
+    uint64_t entry = proc->entry;
+    uint64_t stack_top = proc->stack_top;
+    kfree(proc);
+    enter_usermode((void (*)(void))(uintptr_t)entry, (void *)(uintptr_t)stack_top,
+                   GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
 }

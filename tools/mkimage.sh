@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Stages the bootloader, kernel, and userland program into a directory
-# laid out like an EFI System Partition.
-# Usage: mkimage.sh <esp-dir> <BOOTX64.EFI> <kernel.elf> <init.elf>
+# Stages the bootloader, kernel, and every userland program into a
+# directory laid out like an EFI System Partition.
+# Usage: mkimage.sh <esp-dir> <BOOTX64.EFI> <kernel.elf> <program.elf>...
 #
 # We don't build an actual FAT disk image here. QEMU's built-in VVFAT
 # driver (`-drive file=fat:16:rw:<dir>`, forced to FAT16 so the kernel's
@@ -20,12 +20,20 @@ set -euo pipefail
 ESP_DIR="$1"
 BOOTLOADER="$2"
 KERNEL="$3"
-USERPROG="$4"
+shift 3
 
 rm -rf "$ESP_DIR"
 mkdir -p "$ESP_DIR/EFI/BOOT"
 cp "$BOOTLOADER" "$ESP_DIR/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL" "$ESP_DIR/kernel.elf"
-cp "$USERPROG" "$ESP_DIR/INIT.ELF"
+
+# Every remaining argument is a userland program, staged as an
+# uppercased 8.3 name (e.g. build/shell.elf -> SHELL.ELF) -- that's
+# what fat16.c's format_83() expects to match against.
+for prog in "$@"; do
+    name="$(basename "$prog" .elf)"
+    upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+    cp "$prog" "$ESP_DIR/${upper}.ELF"
+done
 
 echo "staged ESP directory at $ESP_DIR"

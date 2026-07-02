@@ -38,4 +38,11 @@ int fat16_open(const char *name, fat16_file_t *out);
  * chain. Returns the number of bytes actually copied. */
 uint32_t fat16_read(const fat16_file_t *file, void *buf, uint32_t max_len);
 
+/* Fills buf with every root-directory filename, one per line, formatted
+ * as "NAME.EXT" (padding stripped, dot omitted for extension-less
+ * names) -- for the shell's `ls`. Always NUL-terminates within max_len
+ * (truncating the listing if it doesn't fit) and returns the number of
+ * bytes written, not counting the NUL. */
+uint32_t fat16_list_root(char *buf, uint32_t max_len);
+
 #endif /* REBORNOS_FAT16_H */

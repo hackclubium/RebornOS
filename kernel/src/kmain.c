@@ -15,7 +15,8 @@
 #include "gdt.h"
 #include "syscall.h"
 #include "vfs.h"
-#include "elf_loader.h"
+#include "keyboard.h"
+#include "process.h"
 
 /* Tiny int $0x80 wrappers for the ring-3 demo program below. "+a"(ret)
  * both supplies the syscall number (via ret's initial value) and reads
@@ -100,42 +101,16 @@ static void process_b_launcher(void) {
     enter_usermode(process_b_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
 }
 
-/* Reads INIT.ELF off the real FAT32 filesystem and maps it into a fresh
- * address space -- unlike every process above, this one is not a
- * function baked into the kernel image; it's a completely separate
- * ELF64 executable (see userland/init.c) discovered and loaded off
- * disk at boot, the way a real OS starts any program. `arg` is the
- * elf_process_t (entry point + stack top) elf_load_user_program()
- * already computed, passed through via thread_create_process_arg(). */
-static void loaded_program_launcher(void *arg) {
-    elf_process_t *proc = (elf_process_t *)arg;
-    enter_usermode((void (*)(void))(uintptr_t)proc->entry, (void *)(uintptr_t)proc->stack_top,
-                   GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
-}
-
-/* Loads INIT.ELF (see userland/init.c, staged onto the ESP by
- * mkimage.sh) via the VFS/FAT32/ELF-loader stack and returns a thread
- * id ready for the scheduler, exactly like thread_create_process() for
- * the baked-in demo processes above -- the only difference is where the
- * code came from. Panics if the file is missing: on a from-scratch OS
- * a missing init program is a boot failure, not something to limp
- * along without. */
-static int load_and_launch_init_program(void) {
-    void *elf_data = NULL;
-    uint32_t elf_size = 0;
-    if (!vfs_read_file("INIT.ELF", &elf_data, &elf_size)) {
-        panic("kmain: INIT.ELF not found on the ESP");
+/* Boots SHELL.ELF (see userland/shell.c) the same way every other
+ * "real" process is started -- process_spawn() reads it off the FAT16
+ * volume, maps it into a fresh address space, and hands it a thread.
+ * Panics if it's missing: on a from-scratch OS with no other way to
+ * launch a program, a missing shell is a boot failure, not something
+ * to limp along without. */
+static void boot_shell(void) {
+    if (process_spawn("SHELL.ELF", "shell") < 0) {
+        panic("kmain: SHELL.ELF not found on the ESP");
     }
-
-    uint64_t cr3 = vmm_create_address_space();
-    elf_process_t *proc = (elf_process_t *)kmalloc(sizeof(elf_process_t));
-    if (proc == NULL) {
-        panic("kmain: kmalloc failed for the loaded program's launch info");
-    }
-    elf_load_user_program((const uint8_t *)elf_data, elf_size, cr3, proc);
-    kfree(elf_data);
-
-    return thread_create_process_arg("init", loaded_program_launcher, proc, cr3);
 }
 
 #ifdef REBORNOS_TEST_MODE
@@ -164,21 +139,40 @@ static void worker_b(void) {
     }
 }
 
+/* Proves process_spawn_and_wait()'s core mechanic -- spawn a program
+ * off disk, cooperatively yield until it exits, observe it really did
+ * finish -- from a plain kernel thread, without needing a keyboard or
+ * a human typing into the real shell. This is the exact code path
+ * SYS_EXEC uses; only the caller (a syscall handler vs. this thread)
+ * differs. Also doubles as a thread_exit() exercise: this thread ends
+ * itself the same way any other one does. */
+static volatile int exec_wait_ok = 0;
+
+static void exec_wait_test_thread(void) {
+    if (process_spawn_and_wait("INIT.ELF", "exec-test") != 0) {
+        panic("exec/thread-exit self-test: INIT.ELF not found");
+    }
+    exec_wait_ok = 1;
+    thread_exit();
+}
+
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
     /* syscall_write_count >= 6: ring3_program's 5 fixed writes plus
-     * INIT.ELF's one write, both deterministic regardless of exactly
-     * when process A/B's own finish-messages land (see process_body --
-     * their ok-counter and their sys_write race against each other, so
-     * their contribution to this count isn't guaranteed at any given
-     * instant, but these two are). */
+     * INIT.ELF's one write (via the exec/thread-exit self-test), both
+     * deterministic regardless of exactly when process A/B's own
+     * finish-messages land (see process_body -- their ok-counter and
+     * their sys_write race against each other, so their contribution
+     * to this count isn't guaranteed at any given instant, but these
+     * two are). */
     while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 6 ||
-           process_a_ok < 200 || process_b_ok < 200) {
+           process_a_ok < 200 || process_b_ok < 200 || exec_wait_ok < 1) {
         spins++;
         if (spins > 4000000000ULL) {
             panic("scheduler/syscall/isolation self-test: no progress "
-                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu)",
-                  worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok);
+                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d)",
+                  worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok,
+                  exec_wait_ok);
         }
     }
     kprintf("TEST MODE: scheduler+syscall+isolation self-test passed "
@@ -211,7 +205,7 @@ void kmain(boot_info_t *info) {
 
     fb_init(&info->framebuffer);
     fb_clear(0x00102030);
-    fb_puts(8, 8, "REBORNOS -- MILESTONE 5: DISK-LOADED PROGRAMS", 0xFFFFFFFF, 0x00102030);
+    fb_puts(8, 8, "REBORNOS -- MILESTONE 6: INTERACTIVE SHELL", 0xFFFFFFFF, 0x00102030);
     fb_puts(8, 24, "SERIAL + FRAMEBUFFER ALIVE.", 0xFFA0A0A0, 0x00102030);
 
     kprintf("kmain: boot checks complete\n");
@@ -220,6 +214,7 @@ void kmain(boot_info_t *info) {
     pmm_init(info);
     vmm_init();
     idt_init();
+    keyboard_init();
     timer_init(100);
     heap_init();
     vfs_init(info);
@@ -312,6 +307,22 @@ void kmain(boot_info_t *info) {
     }
     kprintf("TEST MODE: heap self-test passed (%lu bytes free)\n", heap_free_bytes());
 
+    /* Exercise the keyboard driver's buffer + translation path without
+     * needing a real keystroke: inject characters the same way a real
+     * scancode's translated ASCII would land in the ring buffer, then
+     * read them back in order and confirm the buffer reports empty
+     * once drained. */
+    keyboard_inject_char('h');
+    keyboard_inject_char('i');
+    keyboard_inject_char('\n');
+    if (keyboard_read_char() != 'h' || keyboard_read_char() != 'i' || keyboard_read_char() != '\n') {
+        panic("keyboard self-test: characters didn't round-trip in order");
+    }
+    if (keyboard_read_char() != -1) {
+        panic("keyboard self-test: buffer should be empty after reading everything back");
+    }
+    kprintf("TEST MODE: keyboard self-test passed\n");
+
     kprintf("TEST MODE: starting scheduler+syscall+isolation self-test\n");
     scheduler_init();
     thread_create("worker-a", worker_a);
@@ -320,7 +331,8 @@ void kmain(boot_info_t *info) {
     thread_create("user", user_thread_launcher);
     thread_create_process("process-a", process_a_launcher, vmm_create_address_space());
     thread_create_process("process-b", process_b_launcher, vmm_create_address_space());
-    load_and_launch_init_program();
+    thread_create("exec-wait-test", exec_wait_test_thread);
+    boot_shell();
     timer_set_tick_callback(schedule);
     scheduler_start();
     panic("kmain: scheduler_start returned -- unreachable");
@@ -337,7 +349,7 @@ void kmain(boot_info_t *info) {
     thread_create("user", user_thread_launcher);
     thread_create_process("process-a", process_a_launcher, vmm_create_address_space());
     thread_create_process("process-b", process_b_launcher, vmm_create_address_space());
-    load_and_launch_init_program();
+    boot_shell();
     timer_set_tick_callback(schedule);
     scheduler_start();
     panic("kmain: scheduler_start returned -- unreachable");

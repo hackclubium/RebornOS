@@ -75,12 +75,18 @@ static void exception_handler(interrupt_frame_t *frame) {
           frame->vector, exception_name(frame->vector), frame->rip, frame->error_code);
 }
 
-/* IRQs (vector >= 32) are wired up by timer.c; declared weak-ish via a
- * plain function pointer so idt.c doesn't need to know about the PIC. */
-static void (*irq_handler)(interrupt_frame_t *frame) = NULL;
+/* IRQs (vector >= 32) are wired up by individual device drivers
+ * (timer.c, keyboard.c, ...), indexed by PIC-relative IRQ line rather
+ * than raw vector so idt.c doesn't need to know about the PIC's
+ * remap offset. Sized for IRQ0-15 (both legacy PICs), even though only
+ * two lines are actually used today. */
+#define IRQ_HANDLER_COUNT 16
+static void (*irq_handlers[IRQ_HANDLER_COUNT])(interrupt_frame_t *frame);
 
-void idt_set_irq_handler(void (*handler)(interrupt_frame_t *frame)) {
-    irq_handler = handler;
+void idt_set_irq_handler(uint8_t irq, void (*handler)(interrupt_frame_t *frame)) {
+    if (irq < IRQ_HANDLER_COUNT) {
+        irq_handlers[irq] = handler;
+    }
 }
 
 void interrupt_dispatch(interrupt_frame_t *frame) {
@@ -92,8 +98,11 @@ void interrupt_dispatch(interrupt_frame_t *frame) {
         syscall_dispatch(frame);
         return;
     }
-    if (irq_handler != NULL) {
-        irq_handler(frame);
+    if (frame->vector >= 32 && frame->vector < 32 + IRQ_HANDLER_COUNT) {
+        uint8_t irq = (uint8_t)(frame->vector - 32);
+        if (irq_handlers[irq] != NULL) {
+            irq_handlers[irq](frame);
+        }
     }
 }
 

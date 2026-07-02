@@ -32,3 +32,7 @@ int vfs_read_file(const char *path, void **out_buf, uint32_t *out_size) {
     *out_size = file.size;
     return 1;
 }
+
+uint32_t vfs_list_root(char *buf, uint32_t max_len) {
+    return fat16_list_root(buf, max_len);
+}
