@@ -15,8 +15,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bison flex libgmp-dev libmpc-dev libmpfr-dev \
-              texinfo libisl-dev qemu-system-x86 ovmf mtools gdisk \
-              gcc-mingw-w64-x86-64
+              texinfo libisl-dev qemu-system-x86 ovmf gcc-mingw-w64-x86-64
 
       # Building x86_64-elf-gcc from source takes 20-40 minutes. Caching
       # it keyed on the build script means CI only pays that cost when

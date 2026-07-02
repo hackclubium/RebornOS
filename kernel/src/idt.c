@@ -1,0 +1,104 @@
+#include <stdint.h>
+#include <stddef.h>
+#include "interrupts.h"
+#include "panic.h"
+
+extern uint64_t isr_stub_table[IDT_VECTOR_COUNT];
+
+typedef struct __attribute__((packed)) {
+    uint16_t offset_low;
+    uint16_t selector;
+    uint8_t ist;
+    uint8_t type_attr;
+    uint16_t offset_mid;
+    uint32_t offset_high;
+    uint32_t reserved;
+} idt_entry_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t limit;
+    uint64_t base;
+} idt_ptr_t;
+
+#define IDT_ENTRY_COUNT 256
+#define IDT_TYPE_INTERRUPT_GATE 0x8E /* present, ring 0, 64-bit interrupt gate */
+
+static idt_entry_t idt[IDT_ENTRY_COUNT];
+
+static inline uint16_t read_cs(void) {
+    uint16_t cs;
+    __asm__ volatile("mov %%cs, %0" : "=r"(cs));
+    return cs;
+}
+
+static inline uint64_t read_cr2(void) {
+    uint64_t v;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(v));
+    return v;
+}
+
+static void idt_set_entry(int vector, uint64_t handler, uint16_t selector, uint8_t type_attr) {
+    idt[vector].offset_low = (uint16_t)(handler & 0xFFFF);
+    idt[vector].selector = selector;
+    idt[vector].ist = 0;
+    idt[vector].type_attr = type_attr;
+    idt[vector].offset_mid = (uint16_t)((handler >> 16) & 0xFFFF);
+    idt[vector].offset_high = (uint32_t)(handler >> 32);
+    idt[vector].reserved = 0;
+}
+
+static const char *exception_name(uint64_t vector) {
+    static const char *names[32] = {
+        "Divide Error", "Debug", "NMI", "Breakpoint", "Overflow",
+        "BOUND Range Exceeded", "Invalid Opcode", "Device Not Available",
+        "Double Fault", "Coprocessor Segment Overrun", "Invalid TSS",
+        "Segment Not Present", "Stack-Segment Fault", "General Protection Fault",
+        "Page Fault", "Reserved", "x87 FP Exception", "Alignment Check",
+        "Machine Check", "SIMD FP Exception", "Virtualization Exception",
+        "Control Protection Exception", "Reserved", "Reserved", "Reserved",
+        "Reserved", "Reserved", "Reserved", "Reserved", "Hypervisor Injection",
+        "VMM Communication Exception", "Security Exception",
+    };
+    return (vector < 32) ? names[vector] : "Unknown";
+}
+
+static void exception_handler(interrupt_frame_t *frame) {
+    if (frame->vector == 14) {
+        panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx, fault address (cr2)=0x%lx",
+              frame->vector, exception_name(frame->vector), frame->rip, frame->error_code, read_cr2());
+    }
+    panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx",
+          frame->vector, exception_name(frame->vector), frame->rip, frame->error_code);
+}
+
+/* IRQs (vector >= 32) are wired up by timer.c; declared weak-ish via a
+ * plain function pointer so idt.c doesn't need to know about the PIC. */
+static void (*irq_handler)(interrupt_frame_t *frame) = NULL;
+
+void idt_set_irq_handler(void (*handler)(interrupt_frame_t *frame)) {
+    irq_handler = handler;
+}
+
+void interrupt_dispatch(interrupt_frame_t *frame) {
+    if (frame->vector < 32) {
+        exception_handler(frame);
+        return;
+    }
+    if (irq_handler != NULL) {
+        irq_handler(frame);
+    }
+}
+
+void idt_init(void) {
+    uint16_t cs = read_cs(); /* no kernel GDT yet -- reuse the selector UEFI left us in */
+
+    for (int i = 0; i < IDT_VECTOR_COUNT; i++) {
+        idt_set_entry(i, isr_stub_table[i], cs, IDT_TYPE_INTERRUPT_GATE);
+    }
+
+    idt_ptr_t idt_ptr = {
+        .limit = sizeof(idt) - 1,
+        .base = (uint64_t)(uintptr_t)&idt,
+    };
+    __asm__ volatile("lidt %0" : : "m"(idt_ptr));
+}

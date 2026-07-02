@@ -140,6 +140,17 @@ void pmm_free_page(void *phys_addr) {
     free_pages++;
 }
 
+void pmm_reserve_region(uint64_t phys_addr, uint64_t size) {
+    uint64_t start_page = phys_addr / PMM_PAGE_SIZE;
+    uint64_t end_page = (phys_addr + size + PMM_PAGE_SIZE - 1) / PMM_PAGE_SIZE;
+    for (uint64_t p = start_page; p < end_page && p < bitmap_bits; p++) {
+        if (!bitmap_test(p)) {
+            bitmap_set(p);
+            free_pages--;
+        }
+    }
+}
+
 uint64_t pmm_total_pages(void) {
     return bitmap_bits;
 }

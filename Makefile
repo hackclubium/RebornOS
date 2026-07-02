@@ -45,7 +45,7 @@ $(BOOT_EFI): $(BOOT_OBJS)
 # ---------------------------------------------------------------------
 
 KERNEL_OBJDIR := $(BUILD)/kernel
-KERNEL_SRCS   := entry.S kmain.c serial.c minilib.c framebuffer.c font8x8.c panic.c kprintf.c qemu_debug.c pmm.c
+KERNEL_SRCS   := entry.S kmain.c serial.c minilib.c framebuffer.c font8x8.c panic.c kprintf.c qemu_debug.c pmm.c vmm.c isr_stubs.S idt.c timer.c heap.c scheduler.c context_switch.S
 KERNEL_OBJS   := $(addprefix $(KERNEL_OBJDIR)/,$(patsubst %.S,%.o,$(patsubst %.c,%.o,$(KERNEL_SRCS))))
 KERNEL_ELF    := $(BUILD)/kernel.elf
 
