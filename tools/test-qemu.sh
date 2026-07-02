@@ -17,7 +17,11 @@ rm -f "$BUILD/test-serial.log"
 # `-serial file:...`: QEMU's file: chardev backend buffers writes and
 # isn't guaranteed to flush before the timeout below SIGTERMs it on a
 # hang, which can make a real hang look like silent, contentless output.
-timeout 20 qemu-system-x86_64 \
+#
+# 40s rather than a tighter bound: CI runners have no KVM, so QEMU falls
+# back to software emulation (TCG), which is noticeably slower through
+# OVMF's PEI/DXE/BDS phases than a KVM-accelerated local run.
+timeout 40 qemu-system-x86_64 \
     -machine q35 -m 256M \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS_test.fd" \

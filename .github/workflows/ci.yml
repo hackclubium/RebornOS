@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison flex libgmp-dev libmpc-dev libmpfr-dev \
+              texinfo libisl-dev qemu-system-x86 ovmf mtools gdisk \
+              gcc-mingw-w64-x86-64
+
+      # Building x86_64-elf-gcc from source takes 20-40 minutes. Caching
+      # it keyed on the build script means CI only pays that cost when
+      # the toolchain itself changes, not on every push.
+      - name: Cache cross-compiler
+        id: cross-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/cross
+          key: cross-gcc-${{ runner.os }}-${{ hashFiles('toolchain/build-cross-gcc.sh') }}
+
+      - name: Build cross-compiler
+        if: steps.cross-cache.outputs.cache-hit != 'true'
+        run: make toolchain
+
+      - name: Run boot smoke test
+        run: make test
