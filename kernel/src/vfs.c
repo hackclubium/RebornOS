@@ -2,14 +2,13 @@
 #include <stdint.h>
 #include "vfs.h"
 #include "fat16.h"
+#include "blockdev.h"
 #include "heap.h"
 #include "panic.h"
 
-void vfs_init(const boot_info_t *info) {
-    if (info->disk_image_addr == 0 || info->disk_image_size == 0) {
-        panic("vfs_init: boot_info has no disk image (bootloader BlockIo read failed?)");
-    }
-    fat16_init((const uint8_t *)(uintptr_t)info->disk_image_addr, info->disk_image_size);
+void vfs_init(void) {
+    blockdev_init();
+    fat16_init();
 }
 
 int vfs_read_file(const char *path, void **out_buf, uint32_t *out_size) {

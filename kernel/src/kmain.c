@@ -217,7 +217,7 @@ void kmain(boot_info_t *info) {
     keyboard_init();
     timer_init(100);
     heap_init();
-    vfs_init(info);
+    vfs_init();
 
 #ifdef REBORNOS_TEST_MODE
     /* Exercise the physical allocator: distinct pages, independently

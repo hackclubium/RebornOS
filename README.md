@@ -256,7 +256,7 @@ still reads the whole volume into RAM via UEFI's `BLOCK_IO` before
 OS talks to a real disk), or a shell to launch programs interactively
 instead of `kmain.c` hardcoding which ones to run. Those are next.
 
-## Milestone 6: Interactive Shell (current)
+## Milestone 6: Interactive Shell
 
 Goal: a human can actually type at RebornOS. Every milestone before
 this one was fully scripted -- the kernel deciding on its own what to
@@ -330,6 +330,69 @@ piping/redirection, or running more than one foreground program at a
 time. Those, plus real disk drivers and subdirectories from Milestone
 5's list, are all still ahead.
 
+## Milestone 7: A Real Disk Driver (current)
+
+Goal: stop faking it. Every milestone since the filesystem showed up
+has been reading a one-time copy of the *entire* boot volume that the
+bootloader slurped into RAM before `ExitBootServices` -- convenient,
+but not how an OS actually talks to a disk. This milestone deletes that
+hack and gives the kernel a real AHCI driver instead.
+
+- **`kernel/src/pci.c`**: legacy PCI configuration space access
+  (ports 0xCF8/0xCFC -- works on every x86 PC including QEMU's q35, no
+  ACPI MCFG/ECAM parsing needed for a plain config-space read) and
+  `pci_find_device()`, scanning bus 0's devices/functions for the one
+  matching a given class/subclass/prog-if. Needed 32-bit port I/O
+  (`outl`/`inl`), which `common/include/ioport.h` didn't have yet --
+  every prior driver in this kernel only ever needed single bytes.
+- **`kernel/src/ahci.c`**: a minimal polled AHCI driver implementing
+  `blockdev.h`'s two functions. Finds the ICH9 AHCI controller via
+  `pci.c`, enables memory space + bus mastering, maps ABAR, finds the
+  first port with a SATA disk actually attached (`PxSSTS`/`PxSIG`), and
+  reprograms its command list and FIS receive area (one page each --
+  a physical page from `pmm_alloc_page()` trivially satisfies AHCI's
+  1KiB/256B alignment requirements, so no dedicated aligned allocator
+  was needed). Issues `READ DMA EXT` on a single command slot and polls
+  `PxCI` for completion -- no interrupts, no NCQ, no write support, no
+  BIOS/OS handoff or full HBA reset (OVMF's own AHCI driver just used
+  this exact controller to load our kernel, so it's already in a sane
+  state). This targets QEMU's emulated controller specifically; real
+  hardware may need more care.
+- **`kernel/src/fat16.c` rewritten to read through `blockdev.h`**
+  instead of indexing into a RAM array. The whole FAT gets cached in
+  RAM once at init (small -- FAT16 tops out around 128KiB -- so cluster
+  chain walks don't cost a disk read per step), the root directory is
+  read into a temporary buffer per lookup, and file data is read one
+  cluster at a time straight into the caller's buffer.
+- **A real wrinkle from going through actual disk hardware**: reading
+  the boot sector's LBA 0 via AHCI didn't produce a FAT16 BPB at all --
+  it produced an MBR. The UEFI `BLOCK_IO` handle Milestone 5 used was
+  scoped to the *partition* SimpleFileSystem had already found, so its
+  LBA 0 was implicitly the volume's own boot sector; going through the
+  disk controller directly means LBA 0 is the *whole disk's* first
+  sector, and QEMU's vvfat driver in `:rw:` mode partitions that disk
+  (unlike its floppy mode, which is a superfloppy with no partition
+  table). Fixed by having `fat16_init()` check whether LBA 0 actually
+  looks like a FAT16 BPB, and if it doesn't, parse it as an MBR instead
+  and follow the first partition table entry to find where the real
+  volume starts.
+- **The bootloader's whole-disk RAM copy is gone**: `boot/src/main.c`
+  no longer touches `EFI_BLOCK_IO_PROTOCOL` at all, `boot_info_t` lost
+  its `disk_image_addr`/`disk_image_size` fields, and the QEMU memory
+  bump Milestone 5 needed (256M -> 768M, since vvfat always synthesizes
+  a ~504 MiB disk regardless of how little the host directory contains)
+  reverts back down to 256M now that nothing ever loads that whole
+  volume into guest RAM at once.
+- Existing test-mode coverage (loading `INIT.ELF`, booting `SHELL.ELF`)
+  now exercises the real AHCI path with no changes needed -- if the
+  disk driver were broken, everything downstream would immediately
+  fail instead of needing a dedicated synthetic test.
+
+Not yet: write support, NCQ/interrupt-driven completion, more than one
+port/disk, GPT (only a legacy MBR's first partition entry is read), or
+support for any AHCI controller beyond QEMU's emulated ICH9. Real
+hardware compatibility (spin-up delays, BIOS/OS handoff) is unexplored.
+
 ## Building
 
 Everything here runs inside WSL2 (or native Linux) -- the toolchains
@@ -375,11 +438,12 @@ world. Roadmap so far: physical memory allocator -> virtual memory /
 heap -> interrupts & timers -> scheduler -> user mode & syscalls ->
 per-process address space isolation -> VFS + a FAT16 filesystem + an
 ELF loader for real disk-loaded programs -> a keyboard driver, real
-thread exit, and an interactive shell (done). Next: a real disk driver
-(AHCI/NVMe, replacing the "read the whole volume into RAM at boot"
-approach), subdirectories, and a bigger syscall surface (arguments,
-piping) as programs get more ambitious. GUI, networking, package
-managers, and Linux binary compatibility are deliberately out of scope
-until there's a command-line system that
+thread exit, and an interactive shell -> PCI enumeration and a real
+AHCI disk driver, replacing the "read the whole volume into RAM at
+boot" approach (done). Next: subdirectories, a bigger syscall surface
+(arguments, piping) as programs get more ambitious, and eventually
+write support so the disk isn't purely read-only forever. GUI,
+networking, package managers, and Linux binary compatibility are
+deliberately out of scope until there's a command-line system that
 boots reliably, manages memory correctly, runs isolated programs, and
 touches files.

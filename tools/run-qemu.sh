@@ -16,7 +16,7 @@ ensure_ovmf_vars "$BUILD/OVMF_VARS.fd"
 # without an explicit -vga flag), which needs an actual flush/present
 # command before a raw memory write shows up on screen.
 exec qemu-system-x86_64 \
-    -machine q35 -m 768M -vga std -display gtk,gl=off \
+    -machine q35 -m 256M -vga std -display gtk,gl=off \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
     -drive file=fat:16:rw:"$BUILD/esp",format=raw \

@@ -13,6 +13,18 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
+/* 32-bit port I/O -- needed for PCI's legacy CONFIG_ADDRESS/CONFIG_DATA
+ * mechanism (ports 0xCF8/0xCFC), which only ever moves whole dwords. */
+static inline void outl(uint16_t port, uint32_t val) {
+    __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint32_t inl(uint16_t port) {
+    uint32_t ret;
+    __asm__ volatile("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
 /* A write to an unused port (0x80 is a POST-code port nothing else on
  * a PC uses) takes long enough to act as a short delay -- old PIC/PIT
  * initialization sequences rely on this between writes. */

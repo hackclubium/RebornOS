@@ -2,15 +2,14 @@
 #define REBORNOS_VFS_H
 
 #include <stdint.h>
-#include "boot_info.h"
 
 /* The thinnest possible VFS: exactly one filesystem is ever mounted
- * (the FAT16 volume the bootloader read into RAM -- see fat16.h), so
- * there is no mount table, no path-to-filesystem routing, and no open
- * file descriptors -- just "give me the whole contents of this file".
- * A real VFS (multiple mounts, directories, incremental reads) is
- * future work once there's more than one filesystem to route between. */
-void vfs_init(const boot_info_t *info);
+ * (the FAT16 volume on the boot disk -- see fat16.h), so there is no
+ * mount table, no path-to-filesystem routing, and no open file
+ * descriptors -- just "give me the whole contents of this file". A
+ * real VFS (multiple mounts, directories, incremental reads) is future
+ * work once there's more than one filesystem to route between. */
+void vfs_init(void);
 
 /* Reads the whole file at `path` (an 8.3 name in the root directory --
  * see fat16.h's scope cuts) into a freshly kmalloc'd buffer. Returns 1

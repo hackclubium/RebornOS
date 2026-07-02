@@ -1,7 +1,9 @@
 #include <stdint.h>
 #include "fat16.h"
+#include "blockdev.h"
 #include "panic.h"
 #include "minilib.h"
+#include "heap.h"
 
 /* BPB fields we actually read, at their real on-disk byte offsets.
  * Packed so the compiler doesn't insert padding that would break the
@@ -47,19 +49,25 @@ typedef struct __attribute__((packed)) {
 #define FAT16_EOC_MIN  0xFFF8u /* cluster values >= this mean "end of chain" */
 
 static struct {
-    const uint8_t *disk;
-    uint64_t disk_size;
+    uint64_t partition_lba;    /* absolute LBA the FAT16 volume starts at -- see fat16_init() */
     uint32_t bytes_per_sector;
     uint32_t sectors_per_cluster;
     uint32_t cluster_size_bytes;
     uint32_t fat_start_sector;
     uint32_t root_dir_start_sector;
+    uint32_t root_dir_sectors;
     uint32_t root_dir_entry_count;
     uint32_t first_data_sector;
+    uint16_t *fat_cache;       /* the whole first FAT, read once at init */
+    uint32_t fat_cache_entries;
 } fs;
 
-static const uint8_t *sector_ptr(uint32_t sector) {
-    return fs.disk + (uint64_t)sector * fs.bytes_per_sector;
+/* Every sector number computed from the BPB (fat_start_sector,
+ * root_dir_start_sector, data clusters, ...) is relative to the start
+ * of the FAT16 volume itself -- but the block device reads in
+ * absolute disk LBAs, so every read needs partition_lba added first. */
+static void read_sectors(uint32_t volume_relative_lba, uint32_t count, void *buf) {
+    blockdev_read_sectors(fs.partition_lba + volume_relative_lba, count, buf);
 }
 
 static uint32_t cluster_to_sector(uint32_t cluster) {
@@ -67,29 +75,51 @@ static uint32_t cluster_to_sector(uint32_t cluster) {
 }
 
 static uint32_t fat_next_cluster(uint32_t cluster) {
-    uint32_t fat_byte_offset = cluster * 2;
-    uint32_t fat_sector = fs.fat_start_sector + (fat_byte_offset / fs.bytes_per_sector);
-    uint32_t offset_in_sector = fat_byte_offset % fs.bytes_per_sector;
-    const uint8_t *p = sector_ptr(fat_sector) + offset_in_sector;
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+    if (cluster >= fs.fat_cache_entries) {
+        panic("fat16: cluster chain walked off the end of the FAT (cluster %lu)", (uint64_t)cluster);
+    }
+    return fs.fat_cache[cluster];
 }
 
-void fat16_init(const uint8_t *disk, uint64_t disk_size) {
-    if (disk_size < 512) {
-        panic("fat16_init: disk image too small to hold a boot sector");
-    }
-    if (disk[510] != 0x55 || disk[511] != 0xAA) {
-        panic("fat16_init: missing 0x55AA boot sector signature");
+static int looks_like_fat16_bpb(const fat16_bpb_t *bpb) {
+    return bpb->bytes_per_sector == BLOCKDEV_SECTOR_SIZE && bpb->sectors_per_cluster != 0 &&
+           bpb->num_fats != 0 && bpb->fat_size_16 != 0 && bpb->root_entry_count != 0;
+}
+
+void fat16_init(void) {
+    uint8_t boot_sector[BLOCKDEV_SECTOR_SIZE];
+    blockdev_read_sectors(0, 1, boot_sector);
+
+    if (boot_sector[510] != 0x55 || boot_sector[511] != 0xAA) {
+        panic("fat16_init: missing 0x55AA signature on LBA 0");
     }
 
-    const fat16_bpb_t *bpb = (const fat16_bpb_t *)disk;
-    if (bpb->bytes_per_sector == 0 || bpb->sectors_per_cluster == 0 || bpb->num_fats == 0 ||
-        bpb->fat_size_16 == 0 || bpb->root_entry_count == 0) {
-        panic("fat16_init: BPB doesn't look like FAT16 (check the vvfat drive is forced to fat:16:)");
+    const fat16_bpb_t *bpb = (const fat16_bpb_t *)boot_sector;
+    if (!looks_like_fat16_bpb(bpb)) {
+        /* LBA 0 isn't a FAT16 boot sector directly -- it's an MBR
+         * instead (QEMU's vvfat driver in ":rw:" mode partitions the
+         * disk rather than presenting a "superfloppy" with the
+         * filesystem starting at LBA 0). Follow the first partition
+         * table entry (offset 0x1BE, a 16-byte entry whose LBA-start
+         * field sits at offset 8 within it) to find where the real
+         * volume begins. */
+        uint32_t partition_lba = (uint32_t)boot_sector[0x1BE + 8] |
+                                  ((uint32_t)boot_sector[0x1BE + 9] << 8) |
+                                  ((uint32_t)boot_sector[0x1BE + 10] << 16) |
+                                  ((uint32_t)boot_sector[0x1BE + 11] << 24);
+        if (partition_lba == 0) {
+            panic("fat16_init: LBA 0 is neither a FAT16 boot sector nor an MBR with a usable partition");
+        }
+
+        blockdev_read_sectors(partition_lba, 1, boot_sector);
+        bpb = (const fat16_bpb_t *)boot_sector;
+        if (!looks_like_fat16_bpb(bpb)) {
+            panic("fat16_init: MBR partition 0 (LBA %lu) doesn't look like FAT16 either",
+                  (uint64_t)partition_lba);
+        }
+        fs.partition_lba = partition_lba;
     }
 
-    fs.disk = disk;
-    fs.disk_size = disk_size;
     fs.bytes_per_sector = bpb->bytes_per_sector;
     fs.sectors_per_cluster = bpb->sectors_per_cluster;
     fs.cluster_size_bytes = bpb->bytes_per_sector * bpb->sectors_per_cluster;
@@ -98,8 +128,16 @@ void fat16_init(const uint8_t *disk, uint64_t disk_size) {
     fs.root_dir_entry_count = bpb->root_entry_count;
 
     uint32_t root_dir_bytes = bpb->root_entry_count * (uint32_t)sizeof(fat16_dirent_t);
-    uint32_t root_dir_sectors = (root_dir_bytes + bpb->bytes_per_sector - 1) / bpb->bytes_per_sector;
-    fs.first_data_sector = fs.root_dir_start_sector + root_dir_sectors;
+    fs.root_dir_sectors = (root_dir_bytes + bpb->bytes_per_sector - 1) / bpb->bytes_per_sector;
+    fs.first_data_sector = fs.root_dir_start_sector + fs.root_dir_sectors;
+
+    uint32_t fat_bytes = (uint32_t)bpb->fat_size_16 * bpb->bytes_per_sector;
+    fs.fat_cache = (uint16_t *)kmalloc(fat_bytes);
+    if (fs.fat_cache == NULL) {
+        panic("fat16_init: kmalloc failed for the %lu-byte FAT cache", (uint64_t)fat_bytes);
+    }
+    read_sectors(fs.fat_start_sector, bpb->fat_size_16, fs.fat_cache);
+    fs.fat_cache_entries = fat_bytes / 2;
 }
 
 /* Converts "init.elf" (or "INIT.ELF") into the space-padded, dotless
@@ -133,18 +171,30 @@ static void format_83(const char *name, uint8_t out[11]) {
     }
 }
 
+/* Reads the whole root directory into a freshly kmalloc'd buffer.
+ * Small enough (a few hundred entries -- 16KiB or so for a typical
+ * volume) to just read in one shot rather than streaming sector by
+ * sector; caller must kfree() the result. */
+static uint8_t *read_root_dir(void) {
+    uint8_t *buf = (uint8_t *)kmalloc((uint64_t)fs.root_dir_sectors * fs.bytes_per_sector);
+    if (buf == NULL) {
+        panic("fat16: kmalloc failed for the root directory buffer");
+    }
+    read_sectors(fs.root_dir_start_sector, fs.root_dir_sectors, buf);
+    return buf;
+}
+
 int fat16_open(const char *name, fat16_file_t *out) {
     uint8_t want[11];
     format_83(name, want);
 
-    /* Unlike FAT32, FAT16's root directory is a fixed-size area right
-     * after the FATs -- not addressed by cluster number, so there's no
-     * chain to walk here. */
-    const uint8_t *root = sector_ptr(fs.root_dir_start_sector);
+    uint8_t *root = read_root_dir();
+    int found = 0;
+
     for (uint32_t e = 0; e < fs.root_dir_entry_count; e++) {
         const fat16_dirent_t *de = (const fat16_dirent_t *)(root + e * sizeof(fat16_dirent_t));
         if (de->name[0] == 0x00) {
-            return 0; /* first byte 0x00 marks the end of the directory */
+            break; /* first byte 0x00 marks the end of the directory */
         }
         if (de->name[0] == 0xE5 || de->attr == ATTR_LONG_NAME || (de->attr & ATTR_VOLUME_ID)) {
             continue; /* deleted entry, LFN fragment, or the volume label */
@@ -160,10 +210,13 @@ int fat16_open(const char *name, fat16_file_t *out) {
         if (match) {
             out->first_cluster = ((uint32_t)de->first_cluster_hi << 16) | de->first_cluster_lo;
             out->size = de->file_size;
-            return 1;
+            found = 1;
+            break;
         }
     }
-    return 0;
+
+    kfree(root);
+    return found;
 }
 
 uint32_t fat16_read(const fat16_file_t *file, void *buf, uint32_t max_len) {
@@ -172,20 +225,27 @@ uint32_t fat16_read(const fat16_file_t *file, void *buf, uint32_t max_len) {
     uint32_t cluster = file->first_cluster;
     uint8_t *dst = (uint8_t *)buf;
 
+    uint8_t *cluster_buf = (uint8_t *)kmalloc(fs.cluster_size_bytes);
+    if (cluster_buf == NULL) {
+        panic("fat16_read: kmalloc failed for a %lu-byte cluster buffer", (uint64_t)fs.cluster_size_bytes);
+    }
+
     while (remaining > 0 && cluster >= 2 && cluster < FAT16_EOC_MIN) {
-        uint32_t sector = cluster_to_sector(cluster);
+        read_sectors(cluster_to_sector(cluster), fs.sectors_per_cluster, cluster_buf);
         uint32_t chunk = fs.cluster_size_bytes < remaining ? fs.cluster_size_bytes : remaining;
-        memcpy(dst, sector_ptr(sector), chunk);
+        memcpy(dst, cluster_buf, chunk);
         dst += chunk;
         remaining -= chunk;
         cluster = fat_next_cluster(cluster);
     }
+
+    kfree(cluster_buf);
     return total - remaining;
 }
 
 uint32_t fat16_list_root(char *buf, uint32_t max_len) {
+    uint8_t *root = read_root_dir();
     uint32_t written = 0;
-    const uint8_t *root = sector_ptr(fs.root_dir_start_sector);
 
     for (uint32_t e = 0; e < fs.root_dir_entry_count; e++) {
         const fat16_dirent_t *de = (const fat16_dirent_t *)(root + e * sizeof(fat16_dirent_t));
@@ -215,6 +275,8 @@ uint32_t fat16_list_root(char *buf, uint32_t max_len) {
         memcpy(buf + written, line, li);
         written += li;
     }
+
+    kfree(root);
 
     if (max_len > 0) {
         buf[written < max_len ? written : max_len - 1] = '\0';

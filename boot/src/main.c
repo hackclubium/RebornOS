@@ -1,7 +1,6 @@
 #include "efi.h"
 #include "efi_file.h"
 #include "efi_gop.h"
-#include "efi_block_io.h"
 #include "elf64.h"
 #include "boot_info.h"
 #include "serial.h"
@@ -11,7 +10,6 @@ static const EFI_GUID gEfiLoadedImageProtocolGuid = EFI_LOADED_IMAGE_PROTOCOL_GU
 static const EFI_GUID gEfiSimpleFileSystemProtocolGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
 static const EFI_GUID gEfiFileInfoGuid = EFI_FILE_INFO_ID;
 static const EFI_GUID gEfiGraphicsOutputProtocolGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
-static const EFI_GUID gEfiBlockIoProtocolGuid = EFI_BLOCK_IO_PROTOCOL_GUID;
 
 static void log(const char *s) {
     serial_write(s);
@@ -99,45 +97,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
     kernel_file->Close(kernel_file);
 
-    /* 2b. Read the whole ESP volume into RAM via EFI_BLOCK_IO_PROTOCOL,
-     * on the very same DeviceHandle SimpleFileSystem just used. For a
-     * FAT partition, this handle's own block space IS the FAT volume's
-     * LBA space (LBA 0 is the boot sector) -- no MBR/GPT parsing needed.
-     * There's no disk driver in the kernel yet, so this in-RAM copy is
-     * how the kernel's FAT32 driver gets bytes to parse after
-     * ExitBootServices; a real disk driver (AHCI/NVMe) is future work. */
-    EFI_BLOCK_IO_PROTOCOL *block_io = NULL;
-    status = bs->HandleProtocol(loaded_image->DeviceHandle, (EFI_GUID *)&gEfiBlockIoProtocolGuid, (VOID **)&block_io);
-    if (EFI_ERROR(status)) {
-        fatal("HandleProtocol(BlockIo) failed");
-    }
-
-    UINT64 disk_block_size = block_io->Media->BlockSize;
-    UINT64 disk_image_size = (block_io->Media->LastBlock + 1) * disk_block_size;
-
-    log("disk image size: ");
-    log_hex(disk_image_size);
-    log(" (block size ");
-    log_hex(disk_block_size);
-    log(", last block ");
-    log_hex(block_io->Media->LastBlock);
-    log(")\n");
-
-    VOID *disk_image_buffer = NULL;
-    status = bs->AllocatePool(EfiLoaderData, disk_image_size, &disk_image_buffer);
-    if (EFI_ERROR(status)) {
-        fatal("AllocatePool(disk image) failed");
-    }
-
-    status = block_io->ReadBlocks(block_io, block_io->Media->MediaId, 0, disk_image_size, disk_image_buffer);
-    if (EFI_ERROR(status)) {
-        fatal("ReadBlocks(whole ESP volume) failed");
-    }
-
-    log("disk image: ");
-    log_hex(disk_image_size);
-    log(" bytes read via BlockIo\n");
-
     /* 3. Parse the ELF64 header and load every PT_LOAD segment at its
      * physical address. UEFI hands us the CPU already in long mode with
      * an identity map covering usable RAM, so "physical address" and
@@ -189,9 +148,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         fatal("AllocatePool(boot_info) failed");
     }
     memset(info, 0, sizeof(*info));
-
-    info->disk_image_addr = (uint64_t)(UINTN)disk_image_buffer;
-    info->disk_image_size = disk_image_size;
 
     EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode_info = gop->Mode->Info;
     if (mode_info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor) {

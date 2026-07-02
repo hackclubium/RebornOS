@@ -3,11 +3,8 @@
 
 #include <stdint.h>
 
-/* A read-only FAT16 driver over an in-RAM disk image (see boot_info.h's
- * disk_image_addr -- there's no disk driver yet, so the bootloader
- * reads the whole volume into RAM via EFI_BLOCK_IO_PROTOCOL before
- * ExitBootServices, and this parses that same byte buffer as if it had
- * come off a real disk).
+/* A read-only FAT16 driver over the real boot disk, read sector by
+ * sector through blockdev.h (see ahci.c) -- no more in-RAM disk image.
  *
  * FAT16, not FAT32: QEMU's own vvfat driver documents its FAT32 mode as
  * untested, and it really is broken here -- forcing it produced a
@@ -23,11 +20,13 @@ typedef struct {
     uint32_t size; /* bytes */
 } fat16_file_t;
 
-/* Parses the BPB at disk[0] and panics if it doesn't look like a valid
- * FAT16 volume -- a malformed boot sector means nothing downstream
- * (VFS, ELF loading) can work, so failing loudly here beats a
- * mysterious crash three layers up. */
-void fat16_init(const uint8_t *disk, uint64_t disk_size);
+/* Reads the boot sector via blockdev_read_sectors() and panics if it
+ * doesn't look like a valid FAT16 volume -- a malformed boot sector
+ * means nothing downstream (VFS, ELF loading) can work, so failing
+ * loudly here beats a mysterious crash three layers up. Also reads and
+ * caches the whole FAT in RAM (small -- FAT16 tops out around 128KiB),
+ * so cluster-chain walks don't need a disk read per step. */
+void fat16_init(void);
 
 /* Looks up `name` (case-insensitive, matched against the FAT 8.3 short
  * name -- e.g. "init.elf" matches an on-disk "INIT    ELF") in the root
