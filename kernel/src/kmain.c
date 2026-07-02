@@ -12,6 +12,41 @@
 #include "timer.h"
 #include "heap.h"
 #include "scheduler.h"
+#include "gdt.h"
+#include "syscall.h"
+
+/* Tiny int $0x80 wrappers for the ring-3 demo program below. "+a"(ret)
+ * both supplies the syscall number (via ret's initial value) and reads
+ * back the kernel's return value from the same register afterward. */
+static inline int64_t sys_write(const char *s) {
+    int64_t ret = SYS_WRITE;
+    __asm__ volatile("int $0x80" : "+a"(ret) : "D"(s) : "memory", "cc");
+    return ret;
+}
+
+static inline void sys_exit(int64_t code) {
+    __asm__ volatile("int $0x80" : : "a"((int64_t)SYS_EXIT), "D"(code));
+    __builtin_unreachable();
+}
+
+static void ring3_program(void) {
+    for (int i = 0; i < 5; i++) {
+        sys_write("hello from ring3\n");
+    }
+    sys_exit(0);
+}
+
+/* An ordinary kernel thread whose only job is the one-way trip into
+ * ring 3 -- everything after enter_usermode() is dormant until a
+ * syscall or interrupt from ring3_program reactivates this thread's
+ * kernel stack. */
+static void user_thread_launcher(void) {
+    uint8_t *user_stack = (uint8_t *)kmalloc(SCHEDULER_STACK_SIZE);
+    if (user_stack == NULL) {
+        panic("user_thread_launcher: kmalloc failed for the user stack");
+    }
+    enter_usermode(ring3_program, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
+}
 
 #ifdef REBORNOS_TEST_MODE
 /* Two worker threads that just count, plus a monitor thread that waits
@@ -41,14 +76,15 @@ static void worker_b(void) {
 
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
-    while (worker_a_count < 1000 || worker_b_count < 1000) {
+    while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 5) {
         spins++;
         if (spins > 2000000000ULL) {
-            panic("scheduler self-test: workers did not make interleaved progress (a=%lu b=%lu)",
-                  worker_a_count, worker_b_count);
+            panic("scheduler/syscall self-test: no interleaved progress (a=%lu b=%lu syscalls=%lu)",
+                  worker_a_count, worker_b_count, syscall_write_count);
         }
     }
-    kprintf("TEST MODE: scheduler self-test passed (a=%lu b=%lu)\n", worker_a_count, worker_b_count);
+    kprintf("TEST MODE: scheduler+syscall self-test passed (a=%lu b=%lu syscalls=%lu)\n",
+            worker_a_count, worker_b_count, syscall_write_count);
     qemu_debug_exit(QEMU_DEBUG_EXIT_SUCCESS);
 }
 #else
@@ -76,11 +112,12 @@ void kmain(boot_info_t *info) {
 
     fb_init(&info->framebuffer);
     fb_clear(0x00102030);
-    fb_puts(8, 8, "REBORNOS -- MILESTONE 2: PREEMPTIVE MULTITASKING", 0xFFFFFFFF, 0x00102030);
+    fb_puts(8, 8, "REBORNOS -- MILESTONE 3: USER MODE + SYSCALLS", 0xFFFFFFFF, 0x00102030);
     fb_puts(8, 24, "SERIAL + FRAMEBUFFER ALIVE.", 0xFFA0A0A0, 0x00102030);
 
     kprintf("kmain: boot checks complete\n");
 
+    gdt_init();
     pmm_init(info);
     vmm_init();
     idt_init();
@@ -175,11 +212,12 @@ void kmain(boot_info_t *info) {
     }
     kprintf("TEST MODE: heap self-test passed (%lu bytes free)\n", heap_free_bytes());
 
-    kprintf("TEST MODE: starting scheduler self-test\n");
+    kprintf("TEST MODE: starting scheduler+syscall self-test\n");
     scheduler_init();
     thread_create("worker-a", worker_a);
     thread_create("worker-b", worker_b);
     thread_create("monitor", scheduler_monitor);
+    thread_create("user", user_thread_launcher);
     timer_set_tick_callback(schedule);
     scheduler_start();
     panic("kmain: scheduler_start returned -- unreachable");
@@ -193,6 +231,7 @@ void kmain(boot_info_t *info) {
     kprintf("kmain: starting scheduler\n");
     scheduler_init();
     thread_create("idle", idle_thread);
+    thread_create("user", user_thread_launcher);
     timer_set_tick_callback(schedule);
     scheduler_start();
     panic("kmain: scheduler_start returned -- unreachable");

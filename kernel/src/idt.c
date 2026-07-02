@@ -4,6 +4,8 @@
 #include "panic.h"
 
 extern uint64_t isr_stub_table[IDT_VECTOR_COUNT];
+extern void isr_stub_128(void); /* int $0x80 -- registered directly, not part of isr_stub_table */
+extern void syscall_dispatch(interrupt_frame_t *frame);
 
 typedef struct __attribute__((packed)) {
     uint16_t offset_low;
@@ -21,7 +23,9 @@ typedef struct __attribute__((packed)) {
 } idt_ptr_t;
 
 #define IDT_ENTRY_COUNT 256
-#define IDT_TYPE_INTERRUPT_GATE 0x8E /* present, ring 0, 64-bit interrupt gate */
+#define IDT_TYPE_INTERRUPT_GATE      0x8E /* present, ring 0, 64-bit interrupt gate */
+#define IDT_TYPE_INTERRUPT_GATE_DPL3 0xEE /* same, but DPL=3 so `int $0x80` from ring 3 doesn't #GP */
+#define SYSCALL_VECTOR 128
 
 static idt_entry_t idt[IDT_ENTRY_COUNT];
 
@@ -84,17 +88,22 @@ void interrupt_dispatch(interrupt_frame_t *frame) {
         exception_handler(frame);
         return;
     }
+    if (frame->vector == SYSCALL_VECTOR) {
+        syscall_dispatch(frame);
+        return;
+    }
     if (irq_handler != NULL) {
         irq_handler(frame);
     }
 }
 
 void idt_init(void) {
-    uint16_t cs = read_cs(); /* no kernel GDT yet -- reuse the selector UEFI left us in */
+    uint16_t cs = read_cs(); /* gdt_init() must have already run, so this is our own kernel CS */
 
     for (int i = 0; i < IDT_VECTOR_COUNT; i++) {
         idt_set_entry(i, isr_stub_table[i], cs, IDT_TYPE_INTERRUPT_GATE);
     }
+    idt_set_entry(SYSCALL_VECTOR, (uint64_t)(uintptr_t)isr_stub_128, cs, IDT_TYPE_INTERRUPT_GATE_DPL3);
 
     idt_ptr_t idt_ptr = {
         .limit = sizeof(idt) - 1,

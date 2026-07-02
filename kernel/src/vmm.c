@@ -13,6 +13,9 @@
 
 #define PAGE_PRESENT  (1ULL << 0)
 #define PAGE_WRITABLE (1ULL << 1)
+#define PAGE_USER     (1ULL << 2)  /* accessible from ring 3 -- must be set at EVERY level of the
+                                    * walk (PML4/PDPT/PD), not just the leaf, or the CPU treats the
+                                    * page as supervisor-only regardless of the leaf's own bit */
 #define PAGE_HUGE     (1ULL << 7)  /* PS bit: valid at the PD level, makes a 2 MiB leaf */
 #define PAGE_NX       (1ULL << 63)
 
@@ -53,15 +56,21 @@ void vmm_init(void) {
 
     pte_t *pml4 = alloc_table();
     pte_t *pdpt = alloc_table();
-    pml4[0] = (uint64_t)(uintptr_t)pdpt | PAGE_PRESENT | PAGE_WRITABLE;
+    pml4[0] = (uint64_t)(uintptr_t)pdpt | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 
     for (int gib = 0; gib < IDENTITY_MAP_GIB; gib++) {
         pte_t *pd = alloc_table();
-        pdpt[gib] = (uint64_t)(uintptr_t)pd | PAGE_PRESENT | PAGE_WRITABLE;
+        pdpt[gib] = (uint64_t)(uintptr_t)pd | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 
         for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
             uint64_t phys = (uint64_t)gib * GIB + (uint64_t)i * HUGE_PAGE_SIZE;
-            pte_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
+            /* PAGE_USER on the whole identity map, not just where a user
+             * program happens to run: there's no per-process address
+             * space yet (see gdt.h/syscall.c), so kernel and "user"
+             * code share these exact page tables. Real process
+             * isolation -- restricting user mode to only its own
+             * pages -- is a later milestone. */
+            pte_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_HUGE;
             if (phys >= KERNEL_EXEC_LIMIT) {
                 flags |= PAGE_NX;
             }

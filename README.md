@@ -45,7 +45,7 @@ bootloader already hands off.
 - Test mode exercises the allocator: distinct pages, independently
   writable, freed pages become reusable again.
 
-## Milestone 2: Preemptive Multitasking (current)
+## Milestone 2: Preemptive Multitasking
 
 Goal: the kernel owns its own address space, can allocate memory
 dynamically, reacts to CPU exceptions and hardware interrupts instead
@@ -80,7 +80,49 @@ once.
   1000 before reporting success -- if the scheduler only ever ran one
   thread, this would hang until the test harness's own timeout.
 
-Not yet: processes, syscalls, a filesystem, or a shell. Those are
+## Milestone 3: User Mode + Syscalls (current)
+
+Goal: the CPU actually drops to ring 3, user code can ask the kernel to
+do things on its behalf through a real syscall boundary, and the
+kernel gets back control safely when it's done.
+
+- **`kernel/src/gdt.c` + `gdt_asm.S`**: RebornOS's own GDT (replacing
+  UEFI's, same as Milestone 2 replaced UEFI's page tables) with kernel
+  and user code/data segments, plus a 64-bit TSS whose `RSP0` is the
+  kernel stack the CPU switches to on any ring3->ring0 transition.
+  `enter_usermode()` builds a fake interrupt-return frame by hand and
+  executes `iretq` -- the only way to drop CPL going down.
+- **`int $0x80`**: a syscall vector reusing the exact same
+  `isr_common_stub`/`interrupt_frame_t` machinery every CPU exception
+  and the timer IRQ already go through, just with a DPL=3 IDT gate so
+  ring 3 is actually allowed to invoke it. `SYS_WRITE` and `SYS_EXIT`
+  are implemented in `kernel/src/syscall.c`.
+- **No per-process address space yet**: user and kernel code share the
+  same page tables (now marked user-accessible in `vmm.c`), so this
+  milestone proves the *mechanism* -- privilege transitions, the
+  syscall boundary, TSS-driven stack switching -- without real process
+  isolation. A user pointer handed to a syscall is trusted directly,
+  which is fine today but would need validation the moment separate
+  address spaces exist. Real isolation is a later milestone.
+- Test mode runs a ring-3 program (still linked into the kernel image
+  -- no filesystem/ELF loader for user binaries yet) that calls
+  `SYS_WRITE` five times over `int $0x80` and then `SYS_EXIT`s,
+  interleaved with the Milestone 2 worker threads. The monitor thread
+  requires all three to make progress before reporting success.
+- One real gotcha this milestone hit: a fresh thread's first "exit" by
+  looping on `hlt` inside the syscall handler would freeze the *entire
+  system* forever, not just that thread -- the handler runs with
+  interrupts disabled (interrupt gate) and never returns via `iretq`,
+  so nothing could ever wake it. Since the scheduler has no way to
+  remove a thread from the round-robin yet, `SYS_EXIT` instead makes
+  the thread voluntarily yield forever, letting everything else keep
+  running.
+
+(Serial output from different threads can interleave mid-line in the
+logs -- `kprintf` has no locking across threads yet. Cosmetic only;
+a real fix is a lock/spinlock primitive, itself a future milestone.)
+
+Not yet: real process isolation, a filesystem, or a shell. Those are
 later milestones, each starting from this same "boots and can't hide a
 bug" foundation.
 
@@ -124,10 +166,11 @@ toolchain/ builds the x86_64-elf-gcc cross-compiler from source
 ## Philosophy
 
 The kernel provides sharp primitives; userspace builds the actual
-world. The roadmap after Milestone 0: physical memory allocator ->
-virtual memory / heap -> interrupts & timers -> scheduler -> processes
--> syscalls -> init -> shell -> VFS -> a first filesystem -> executable
-loading -> real user programs. GUI, networking, package managers, and
-Linux binary compatibility are deliberately out of scope until there's
-a command-line system that boots reliably, manages memory correctly,
-runs programs, and touches files.
+world. Roadmap so far: physical memory allocator -> virtual memory /
+heap -> interrupts & timers -> scheduler -> user mode & syscalls
+(done). Next: real per-process address space isolation -> init -> a
+shell -> VFS -> a first filesystem -> loading real user programs from
+disk. GUI, networking, package managers, and Linux binary compatibility
+are deliberately out of scope until there's a command-line system that
+boots reliably, manages memory correctly, runs isolated programs, and
+touches files.

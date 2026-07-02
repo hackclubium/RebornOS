@@ -63,6 +63,12 @@ ISR_NOERR 31
 /* IRQ0 (timer), remapped to vector 32 -- see pic_remap() in timer.c */
 ISR_NOERR 32
 
+/* Syscall vector (int $0x80). Deliberately NOT added to isr_stub_table
+ * below (that table is sized/indexed for vectors 0-32 only) -- idt.c
+ * registers this one directly by name, with a DPL=3 gate so user mode
+ * is actually allowed to execute `int $0x80` without a #GP. */
+ISR_NOERR 128
+
 .extern interrupt_dispatch
 
 isr_common_stub:

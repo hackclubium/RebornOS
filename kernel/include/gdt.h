@@ -1,0 +1,28 @@
+#ifndef REBORNOS_GDT_H
+#define REBORNOS_GDT_H
+
+#include <stdint.h>
+
+/* Selector values (GDT byte offset, RPL baked into the low 2 bits for
+ * the user ones since every use of them needs RPL=3 anyway). */
+#define GDT_KERNEL_CODE_SEL 0x08u
+#define GDT_KERNEL_DATA_SEL 0x10u
+#define GDT_USER_DATA_SEL   (0x18u | 3u)
+#define GDT_USER_CODE_SEL   (0x20u | 3u)
+#define GDT_TSS_SEL         0x28u
+
+/* Builds and loads our own GDT (replacing UEFI's) plus a TSS whose
+ * RSP0 is a dedicated kernel stack for privilege-elevation on
+ * interrupt/exception/syscall entry from ring 3. Must run before
+ * idt_init(), which reads the *current* CS to populate IDT gates. */
+void gdt_init(void);
+
+/* Builds a fake interrupt-return frame for (entry, user_stack_top,
+ * user_cs, user_ds) and executes iretq, dropping into ring 3 for the
+ * first time. Never returns in the normal sense -- from here on this
+ * thread's kernel-mode call stack is dormant until an interrupt or
+ * syscall from ring 3 reactivates it. */
+__attribute__((noreturn)) void enter_usermode(void (*entry)(void), void *user_stack_top,
+                                               uint16_t user_cs, uint16_t user_ds);
+
+#endif /* REBORNOS_GDT_H */
