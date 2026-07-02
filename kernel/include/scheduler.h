@@ -22,6 +22,14 @@ int thread_create(const char *name, void (*entry)(void));
  * that's going to enter_usermode() into an isolated process. */
 int thread_create_process(const char *name, void (*entry)(void), uint64_t cr3);
 
+/* Same as thread_create_process(), but `entry` receives `arg` (passed
+ * through rdi on its very first run -- see thread_trampoline in
+ * context_switch.S) instead of taking no arguments. Needed when the
+ * same launcher function is reused to start several distinct loaded
+ * programs, each with its own entry point/stack (see elf_loader.h),
+ * rather than a dedicated static launcher per program. */
+int thread_create_process_arg(const char *name, void (*entry)(void *arg), void *arg, uint64_t cr3);
+
 /* Round-robins to the next ready thread. A no-op with 0 or 1 threads.
  * Safe to call from within the timer ISR's call chain. */
 void schedule(void);

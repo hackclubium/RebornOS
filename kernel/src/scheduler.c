@@ -26,7 +26,7 @@ void scheduler_init(void) {
     current_thread = -1;
 }
 
-static int thread_create_ex(const char *name, void (*entry)(void), uint64_t cr3) {
+static int thread_create_ex(const char *name, void (*entry)(void), void *arg, uint64_t cr3) {
     if (thread_count >= SCHEDULER_MAX_THREADS) {
         panic("thread_create: too many threads (max %u)", SCHEDULER_MAX_THREADS);
     }
@@ -46,7 +46,7 @@ static int thread_create_ex(const char *name, void (*entry)(void), uint64_t cr3)
     sp[-1] = (uint64_t)(uintptr_t)thread_trampoline; /* return address `ret` pops */
     sp[-2] = 0;                                      /* rbp */
     sp[-3] = (uint64_t)(uintptr_t)entry;              /* rbx -- thread_trampoline calls *rbx */
-    sp[-4] = 0;                                       /* r12 */
+    sp[-4] = (uint64_t)(uintptr_t)arg;                /* r12 -- thread_trampoline moves this into rdi first */
     sp[-5] = 0;                                       /* r13 */
     sp[-6] = 0;                                       /* r14 */
     sp[-7] = 0;                                       /* r15 */
@@ -72,11 +72,20 @@ static int thread_create_ex(const char *name, void (*entry)(void), uint64_t cr3)
 }
 
 int thread_create(const char *name, void (*entry)(void)) {
-    return thread_create_ex(name, entry, vmm_kernel_cr3());
+    return thread_create_ex(name, entry, NULL, vmm_kernel_cr3());
 }
 
 int thread_create_process(const char *name, void (*entry)(void), uint64_t cr3) {
-    return thread_create_ex(name, entry, cr3);
+    return thread_create_ex(name, entry, NULL, cr3);
+}
+
+int thread_create_process_arg(const char *name, void (*entry)(void *arg), void *arg, uint64_t cr3) {
+    /* Casting between void(*)(void) and void(*)(void*) is only safe
+     * because thread_trampoline always calls through rbx as a bare
+     * `call *%rbx` -- on the SysV x86-64 ABI an unused argument in rdi
+     * is harmless, so the same internal storage works for both entry
+     * shapes. */
+    return thread_create_ex(name, (void (*)(void))(uintptr_t)entry, arg, cr3);
 }
 
 void schedule(void) {

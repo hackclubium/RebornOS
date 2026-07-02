@@ -1,9 +1,11 @@
 #ifndef REBORNOS_ELF64_H
 #define REBORNOS_ELF64_H
 
-/* Minimal ELF64 structures -- just enough to validate the kernel image
- * and walk its PT_LOAD program headers. This is the standard System V
- * ABI layout (stable since the 1990s), not UEFI-specific. */
+/* Minimal ELF64 structures -- just enough to validate an ELF image and
+ * walk its PT_LOAD program headers. This is the standard System V ABI
+ * layout (stable since the 1990s), not UEFI-specific. Shared by the
+ * bootloader (loading kernel.elf) and the kernel (loading user
+ * programs off disk), since both are doing the same walk. */
 
 #include <stdint.h>
 
@@ -16,6 +18,10 @@
 #define ET_EXEC 2
 #define EM_X86_64 62
 #define PT_LOAD 1
+
+#define PF_X 0x1u /* executable */
+#define PF_W 0x2u /* writable */
+#define PF_R 0x4u /* readable (every segment we care about is readable in practice) */
 
 typedef struct {
     uint8_t  e_ident[16];

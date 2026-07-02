@@ -45,7 +45,7 @@ $(BOOT_EFI): $(BOOT_OBJS)
 # ---------------------------------------------------------------------
 
 KERNEL_OBJDIR := $(BUILD)/kernel
-KERNEL_SRCS   := entry.S kmain.c serial.c minilib.c framebuffer.c font8x8.c panic.c kprintf.c qemu_debug.c pmm.c vmm.c isr_stubs.S idt.c timer.c heap.c scheduler.c context_switch.S gdt.c gdt_asm.S syscall.c
+KERNEL_SRCS   := entry.S kmain.c serial.c minilib.c framebuffer.c font8x8.c panic.c kprintf.c qemu_debug.c pmm.c vmm.c isr_stubs.S idt.c timer.c heap.c scheduler.c context_switch.S gdt.c gdt_asm.S syscall.c fat16.c vfs.c elf_loader.c
 KERNEL_OBJS   := $(addprefix $(KERNEL_OBJDIR)/,$(patsubst %.S,%.o,$(patsubst %.c,%.o,$(KERNEL_SRCS))))
 KERNEL_ELF    := $(BUILD)/kernel.elf
 
@@ -86,9 +86,38 @@ $(KERNEL_TEST_ELF): $(KERNEL_TEST_OBJS)
 	$(KCC) $(KLDFLAGS) -o $@ $(KERNEL_TEST_OBJS)
 
 # ---------------------------------------------------------------------
+# Userland (ELF64 user program, built with our own cross-compiler, no
+# libc -- raw int $0x80 syscalls, staged onto the ESP and loaded by the
+# kernel's VFS + FAT32 + ELF loader instead of being baked into the
+# kernel image).
+# ---------------------------------------------------------------------
+
+USER_OBJDIR := $(BUILD)/userland
+USER_SRCS   := init.c
+USER_OBJS   := $(addprefix $(USER_OBJDIR)/,$(USER_SRCS:.c=.o))
+USER_ELF    := $(BUILD)/init.elf
+
+# -mcmodel=large: ELF_USER_LOAD_BASE (0x8000400000, ~512 GiB) is way
+# past the small code model's assumption that everything fits in the
+# low 2 GiB -- without this, the compiler emits 32-bit absolute
+# relocations that silently truncate the real address.
+UCFLAGS  := -ffreestanding -fno-stack-protector -fno-omit-frame-pointer -fno-pic -fno-pie \
+            -mno-red-zone -mgeneral-regs-only -mcmodel=large -Wall -Wextra -std=c17 -MMD -MP
+ULDFLAGS := -T userland/linker.ld -ffreestanding -nostdlib -static -Wl,--build-id=none
+
+$(USER_OBJDIR)/%.o: userland/%.c | $(USER_OBJDIR)
+	$(KCC) $(UCFLAGS) -c $< -o $@
+
+$(USER_OBJDIR):
+	mkdir -p $@
+
+$(USER_ELF): $(USER_OBJS)
+	$(KCC) $(ULDFLAGS) -o $@ $(USER_OBJS)
+
+# ---------------------------------------------------------------------
 # ESP staging directories, booted via QEMU's VVFAT driver
-# (-drive file=fat:rw:<dir>) rather than a hand-built FAT disk image --
-# see tools/mkimage.sh for why.
+# (-drive file=fat:32:rw:<dir>) rather than a hand-built FAT disk image
+# -- see tools/mkimage.sh for why.
 # ---------------------------------------------------------------------
 
 ESP_DIR       := $(BUILD)/esp
@@ -96,12 +125,12 @@ ESP_STAMP     := $(ESP_DIR)/.stamp
 ESP_TEST_DIR  := $(BUILD)/esp-test
 ESP_TEST_STAMP := $(ESP_TEST_DIR)/.stamp
 
-$(ESP_STAMP): $(BOOT_EFI) $(KERNEL_ELF)
-	bash tools/mkimage.sh $(ESP_DIR) $(BOOT_EFI) $(KERNEL_ELF)
+$(ESP_STAMP): $(BOOT_EFI) $(KERNEL_ELF) $(USER_ELF)
+	bash tools/mkimage.sh $(ESP_DIR) $(BOOT_EFI) $(KERNEL_ELF) $(USER_ELF)
 	touch $@
 
-$(ESP_TEST_STAMP): $(BOOT_EFI) $(KERNEL_TEST_ELF)
-	bash tools/mkimage.sh $(ESP_TEST_DIR) $(BOOT_EFI) $(KERNEL_TEST_ELF)
+$(ESP_TEST_STAMP): $(BOOT_EFI) $(KERNEL_TEST_ELF) $(USER_ELF)
+	bash tools/mkimage.sh $(ESP_TEST_DIR) $(BOOT_EFI) $(KERNEL_TEST_ELF) $(USER_ELF)
 	touch $@
 
 # ---------------------------------------------------------------------
@@ -135,4 +164,4 @@ clean:
 # Auto-generated header dependencies (via -MMD -MP above) so editing a
 # .h file correctly triggers a rebuild of everything that includes it,
 # instead of silently linking a stale object file.
--include $(BOOT_OBJS:.o=.d) $(KERNEL_OBJS:.o=.d) $(KERNEL_TEST_OBJS:.o=.d)
+-include $(BOOT_OBJS:.o=.d) $(KERNEL_OBJS:.o=.d) $(KERNEL_TEST_OBJS:.o=.d) $(USER_OBJS:.o=.d)

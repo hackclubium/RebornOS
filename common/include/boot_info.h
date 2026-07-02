@@ -33,6 +33,16 @@ typedef struct {
     uint64_t memory_map_size;
     uint64_t memory_map_descriptor_size;
     uint32_t memory_map_descriptor_version;
+
+    /* The whole ESP volume (the same FAT32 filesystem SimpleFileSystem
+     * used to find kernel.elf), read block-for-block into RAM via
+     * EFI_BLOCK_IO_PROTOCOL before ExitBootServices. There is no disk
+     * driver in the kernel yet (AHCI/NVMe are a future milestone), so
+     * this is how the kernel's own FAT32 driver gets bytes to parse:
+     * disk_image_addr[0] is the volume's own LBA 0 (the FAT32 boot
+     * sector), exactly as if the kernel had read it off a real disk. */
+    uint64_t disk_image_addr;
+    uint64_t disk_image_size;
 } boot_info_t;
 
 #endif /* REBORNOS_BOOT_INFO_H */

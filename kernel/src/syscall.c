@@ -6,6 +6,7 @@
 #include "scheduler.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "elf_loader.h"
 
 volatile uint64_t syscall_write_count = 0;
 
@@ -35,7 +36,15 @@ static int user_ptr_valid(const void *ptr, uint64_t len) {
     if (addr + len <= 4ULL * 1024 * 1024 * 1024) {
         return 1;
     }
-    return addr >= PROCESS_PRIVATE_VADDR && addr + len <= PROCESS_PRIVATE_VADDR + PMM_PAGE_SIZE;
+    if (addr >= PROCESS_PRIVATE_VADDR && addr + len <= PROCESS_PRIVATE_VADDR + PMM_PAGE_SIZE) {
+        return 1;
+    }
+    /* Every program loaded via elf_load_user_program() lives somewhere
+     * between its fixed load base and the top of its (fixed) stack --
+     * see elf_loader.h. All loaded programs share these same two
+     * constants today (there's only ever one load address), so this is
+     * exactly as "necessary but not sufficient" as the check above. */
+    return addr >= ELF_USER_LOAD_BASE && addr + len <= ELF_USER_STACK_TOP;
 }
 
 /* Called from interrupt_dispatch() for vector 128 (int $0x80), reusing

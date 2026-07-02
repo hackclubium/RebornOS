@@ -49,11 +49,16 @@ switch_context:
  * preempted again. thread_create() stashes the real entry point in the
  * rbx slot of the synthetic stack frame (rbx is otherwise unused, just
  * a convenient callee-saved register to smuggle it through), so it
- * ends up here after switch_context's register pops.
+ * ends up here after switch_context's register pops. The r12 slot
+ * likewise carries an optional caller-supplied argument (NULL for
+ * threads started via the plain thread_create()/thread_create_process()
+ * API), moved into rdi -- the first SysV integer argument register --
+ * right before the call.
  */
 .global thread_trampoline
 thread_trampoline:
     sti
+    mov %r12, %rdi
     call *%rbx
     /* Thread entry points loop forever and must never return; if one
      * does, there's nothing valid to return to. */

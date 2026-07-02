@@ -21,11 +21,18 @@ rm -f "$BUILD/test-serial.log"
 # 40s rather than a tighter bound: CI runners have no KVM, so QEMU falls
 # back to software emulation (TCG), which is noticeably slower through
 # OVMF's PEI/DXE/BDS phases than a KVM-accelerated local run.
+#
+# 768M rather than 256M: QEMU's vvfat driver always synthesizes a
+# classic ~504 MiB disk geometry regardless of how little the host
+# directory actually contains, and the bootloader reads that whole
+# volume into RAM (see boot/src/main.c) since there's no disk driver
+# in the kernel yet -- 256M isn't enough room for that one allocation
+# plus everything else.
 timeout 40 qemu-system-x86_64 \
-    -machine q35 -m 256M \
+    -machine q35 -m 768M \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS_test.fd" \
-    -drive file=fat:rw:"$BUILD/esp-test",format=raw \
+    -drive file=fat:16:rw:"$BUILD/esp-test",format=raw \
     -display none \
     -serial stdio \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \

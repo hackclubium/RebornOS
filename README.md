@@ -122,7 +122,7 @@ kernel gets back control safely when it's done.
 logs -- `kprintf` has no locking across threads yet. Cosmetic only;
 a real fix is a lock/spinlock primitive, itself a future milestone.)
 
-## Milestone 4: Process Isolation (current)
+## Milestone 4: Process Isolation
 
 Goal: separate processes actually get separate memory. Milestone 3
 proved the privilege-transition mechanism; this proves the isolation
@@ -173,6 +173,89 @@ baked into the kernel image, not something loaded from disk. Those are
 later milestones, each starting from this same "boots and can't hide a
 bug" foundation.
 
+## Milestone 5: Disk-Loaded Programs (current)
+
+Goal: a "process" stops being a C function compiled into the kernel's
+own binary and becomes an actual file, found and loaded off a real
+filesystem the way a real OS starts any program.
+
+- **The bootloader now reads the whole ESP volume into RAM**
+  (`boot/src/main.c`) via `EFI_BLOCK_IO_PROTOCOL` on the same device
+  handle `SimpleFileSystem` already used to find `kernel.elf` -- for a
+  FAT partition, that handle's own block space *is* the FAT volume's
+  LBA space, so no MBR/GPT parsing is needed. There's no disk driver in
+  the kernel yet (AHCI/NVMe are real hardware-driver work, a separate
+  future milestone), so this in-RAM copy, handed off via two new
+  `boot_info_t` fields, is how the kernel gets bytes to parse.
+- **`kernel/src/fat16.c`**: a read-only FAT16 driver over that in-RAM
+  image -- BPB parsing, FAT cluster-chain walking, 8.3 filename lookup
+  in the root directory. FAT16, not FAT32: QEMU's own `vvfat` driver
+  documents its FAT32 support as untested, and it really is broken here
+  (forcing it produced a volume OVMF's own boot manager couldn't even
+  find). FAT16 turned out simpler anyway -- its root directory is a
+  fixed-size area right after the FATs, not a cluster chain.
+- **`kernel/src/vfs.c`**: the thinnest possible VFS. Exactly one
+  filesystem is ever mounted, so `vfs_read_file(path)` just forwards to
+  the FAT16 driver and returns a `kmalloc`'d buffer with the whole file
+  -- no mount table, no directories, no incremental reads. A real VFS is
+  future work once there's more than one filesystem to route between.
+- **`vmm_map_page()`** (`kernel/src/vmm.c`): a general-purpose 4 KiB
+  page mapper, unlike Milestone 4's `vmm_create_address_space()` which
+  only ever carves out one fixed private page. Walks/allocates
+  PML4->PDPT->PD->PT for an arbitrary virtual address, guarded against
+  ever touching `PML4[0]` -- the single shared low-4GiB mapping every
+  process's page tables point at verbatim, which this must never write
+  into, or one process's program would corrupt every other process's
+  view of the kernel.
+- **`kernel/src/elf_loader.c`**: parses a static ELF64 executable's
+  `PT_LOAD` program headers, allocates a physical page per page of each
+  segment, copies in the file-backed bytes (zeroing the rest for bss),
+  and maps each one into the target process's own address space with
+  per-segment permissions (writable data, executable text, neither for
+  read-only data) via `vmm_map_page()`. Also sets up a small dedicated
+  user stack. This -- not the fixed fake private page from Milestone 4
+  -- is what a real process's memory layout looks like.
+- **`userland/init.c`**: RebornOS's first genuinely separate program.
+  Built with the same cross-compiler, linked to run at a fixed address
+  inside its own private address-space range (never inside the shared
+  low-4GiB region), staged onto the ESP as `INIT.ELF`, and loaded by
+  the kernel at boot the same way `thread_create_process()` already
+  loaded the Milestone 4 demo processes -- except this one came from a
+  file, not from `kmain.c`. No libc, no crt0: `enter_usermode()` already
+  leaves the stack set up, so its entry point is just an ordinary C
+  function using the same raw `int $0x80` syscalls as every other ring-3
+  test program.
+- Two real bugs this milestone caught, both in existing infrastructure
+  the new code just happened to be the first thing to exercise hard
+  enough:
+  - **`panic()` wasn't safe to call from inside a fault.** `%rbp` is not
+    reloaded on a ring3->ring0 transition, so it can hold whatever a
+    user program last left in it; `print_stack_trace()` walking that
+    value can itself fault, re-entering `panic()` from inside
+    `exception_handler()`, which tries the exact same unsafe printing
+    again -- an unbounded fault storm instead of a clean exit. Fixed
+    with a re-entrancy guard: the second entry skips straight to
+    `qemu_debug_exit()`.
+  - **Syscall pointer validation didn't know about loaded programs.**
+    `user_ptr_valid()`'s whitelist only covered the shared low-4GiB
+    region and Milestone 4's one fixed demo page, so it correctly (by
+    its own rules) rejected `INIT.ELF`'s perfectly valid `.rodata`
+    string pointer. Extended with a third range covering every loaded
+    program's fixed load base through its stack top -- exactly as
+    "necessary but not sufficient" as the check it sits next to, since
+    there's still no true per-process access tracking.
+- Test mode now also loads and runs `INIT.ELF` for real, alongside the
+  Milestone 2-4 checks, and asserts on a minimum `SYS_WRITE` count that
+  only `INIT.ELF` and the fixed `ring3_program` can guarantee
+  deterministically (Milestone 4's two isolation processes race their
+  own finish-message writes against the monitor's check).
+
+Not yet: subdirectories, writing to disk, a real disk driver (this
+still reads the whole volume into RAM via UEFI's `BLOCK_IO` before
+`ExitBootServices` -- fine for a small hand-built ESP, not how a real
+OS talks to a real disk), or a shell to launch programs interactively
+instead of `kmain.c` hardcoding which ones to run. Those are next.
+
 ## Building
 
 Everything here runs inside WSL2 (or native Linux) -- the toolchains
@@ -206,6 +289,7 @@ sudo apt-get install -y bison flex libgmp-dev libmpc-dev libmpfr-dev \
 boot/     UEFI bootloader (PE32+, built with mingw)
 kernel/   the kernel (ELF64, built with our own cross-compiler)
 common/   code shared by both (serial driver, boot_info.h, freestanding libc bits)
+userland/ RebornOS's own user programs (ELF64, no libc, loaded off disk at boot)
 tools/    ESP staging, QEMU run/test/debug scripts, panic symbolizer
 toolchain/ builds the x86_64-elf-gcc cross-compiler from source
 ```
@@ -215,9 +299,11 @@ toolchain/ builds the x86_64-elf-gcc cross-compiler from source
 The kernel provides sharp primitives; userspace builds the actual
 world. Roadmap so far: physical memory allocator -> virtual memory /
 heap -> interrupts & timers -> scheduler -> user mode & syscalls ->
-per-process address space isolation (done). Next: init -> a shell ->
-VFS -> a first filesystem -> loading real user programs from disk. GUI,
-networking, package managers, and Linux binary compatibility are
-deliberately out of scope until there's a command-line system that
+per-process address space isolation -> VFS + a FAT16 filesystem + an
+ELF loader for real disk-loaded programs (done). Next: a shell, so
+programs get launched by typing their name instead of `kmain.c`
+hardcoding which ones to run. GUI, networking, package managers, and
+Linux binary compatibility are deliberately out of scope until there's
+a command-line system that
 boots reliably, manages memory correctly, runs isolated programs, and
 touches files.

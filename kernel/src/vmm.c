@@ -117,3 +117,41 @@ uint64_t vmm_create_address_space(void) {
 
     return (uint64_t)(uintptr_t)pml4;
 }
+
+#define TABLE_ADDR_MASK (~0xFFFULL) /* strips flag bits, leaving just the 4KiB-aligned physical address */
+
+void vmm_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr, uint32_t flags) {
+    uint64_t pml4_idx = (vaddr >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (vaddr >> 30) & 0x1FF;
+    uint64_t pd_idx = (vaddr >> 21) & 0x1FF;
+    uint64_t pt_idx = (vaddr >> 12) & 0x1FF;
+
+    if (pml4_idx == 0) {
+        panic("vmm_map_page: refusing to map vaddr 0x%lx into PML4[0] (the shared kernel mapping)", vaddr);
+    }
+
+    pte_t *pml4 = (pte_t *)(uintptr_t)pml4_phys;
+    if (!(pml4[pml4_idx] & PAGE_PRESENT)) {
+        pml4[pml4_idx] = (uint64_t)(uintptr_t)alloc_table() | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    }
+    pte_t *pdpt = (pte_t *)(uintptr_t)(pml4[pml4_idx] & TABLE_ADDR_MASK);
+
+    if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
+        pdpt[pdpt_idx] = (uint64_t)(uintptr_t)alloc_table() | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    }
+    pte_t *pd = (pte_t *)(uintptr_t)(pdpt[pdpt_idx] & TABLE_ADDR_MASK);
+
+    if (!(pd[pd_idx] & PAGE_PRESENT)) {
+        pd[pd_idx] = (uint64_t)(uintptr_t)alloc_table() | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    }
+    pte_t *pt = (pte_t *)(uintptr_t)(pd[pd_idx] & TABLE_ADDR_MASK);
+
+    pte_t leaf_flags = PAGE_PRESENT | PAGE_USER;
+    if (flags & VMM_MAP_WRITE) {
+        leaf_flags |= PAGE_WRITABLE;
+    }
+    if (!(flags & VMM_MAP_EXEC)) {
+        leaf_flags |= PAGE_NX;
+    }
+    pt[pt_idx] = (paddr & TABLE_ADDR_MASK) | leaf_flags;
+}
