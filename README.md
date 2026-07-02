@@ -80,7 +80,7 @@ once.
   1000 before reporting success -- if the scheduler only ever ran one
   thread, this would hang until the test harness's own timeout.
 
-## Milestone 3: User Mode + Syscalls (current)
+## Milestone 3: User Mode + Syscalls
 
 Goal: the CPU actually drops to ring 3, user code can ask the kernel to
 do things on its behalf through a real syscall boundary, and the
@@ -122,7 +122,54 @@ kernel gets back control safely when it's done.
 logs -- `kprintf` has no locking across threads yet. Cosmetic only;
 a real fix is a lock/spinlock primitive, itself a future milestone.)
 
-Not yet: real process isolation, a filesystem, or a shell. Those are
+## Milestone 4: Process Isolation (current)
+
+Goal: separate processes actually get separate memory. Milestone 3
+proved the privilege-transition mechanism; this proves the isolation
+that mechanism exists for in the first place.
+
+- **`vmm_create_address_space()`** (`kernel/src/vmm.c`): every address
+  space's `PML4[0]` points at the exact same shared PDPT Milestone 2
+  built -- kernel code, the heap, the framebuffer, all identical for
+  every process, since kernel code has to stay reachable across any
+  privilege transition no matter which process is running. What makes
+  two processes actually different is `PML4[1]`: a freshly built,
+  process-private PDPT/PD/PT chain mapping exactly one page at a fixed
+  virtual address (`PROCESS_PRIVATE_VADDR`, 0x8000000000). Two
+  processes using that identical virtual address end up backed by two
+  different physical pages -- deliberately minimal (one page, not a
+  general-purpose heap/stack per process), but a real isolation
+  boundary rather than a shared one.
+- **CR3 per thread**: `scheduler.c`'s thread table now carries a `cr3`,
+  loaded on every context switch (`thread_create` uses the kernel's
+  address space; `thread_create_process` uses a fresh one from
+  `vmm_create_address_space()`).
+- **Syscall pointer validation** (`kernel/src/syscall.c`): `SYS_WRITE`
+  now bounds-checks the pointer it's given before dereferencing it,
+  panicking with a clear message instead of an unrelated page fault
+  three calls deep in `kprintf`. Documented as necessary-but-not-
+  sufficient: every process maps its private page at the *same*
+  virtual address, so a syscall still can't distinguish "this
+  process's page" from "some other process's page" without real
+  per-process access tracking, which doesn't exist yet.
+- Test mode runs two ring-3 processes that each repeatedly write a
+  distinct byte pattern to `PROCESS_PRIVATE_VADDR` and immediately read
+  it back, self-reporting failure over syscall if they ever observe the
+  other's value -- interleaved with the Milestone 2/3 checks.
+- The real bug this milestone caught: `TSS.RSP0` is *the* kernel stack
+  the CPU switches to on any ring3->ring0 transition -- there's only
+  one such register. With a single ring-3 thread (Milestone 3) a fixed
+  shared value was harmless. With three ring-3-capable threads, one
+  thread's `SYS_EXIT` yield-loop saved its paused state pointing into
+  that shared stack, and the next thread's syscall promptly overwrote
+  that exact memory before the first thread was ever resumed -- silent
+  corruption, not a crash, manifesting as one thread mysteriously
+  stalling after its first syscall while everything else kept running.
+  Fixed by giving every thread its own kernel stack and having the
+  scheduler update `TSS.RSP0` on every switch, alongside `CR3`.
+
+Not yet: a filesystem or a shell, so a "process" is still a function
+baked into the kernel image, not something loaded from disk. Those are
 later milestones, each starting from this same "boots and can't hide a
 bug" foundation.
 
@@ -167,10 +214,10 @@ toolchain/ builds the x86_64-elf-gcc cross-compiler from source
 
 The kernel provides sharp primitives; userspace builds the actual
 world. Roadmap so far: physical memory allocator -> virtual memory /
-heap -> interrupts & timers -> scheduler -> user mode & syscalls
-(done). Next: real per-process address space isolation -> init -> a
-shell -> VFS -> a first filesystem -> loading real user programs from
-disk. GUI, networking, package managers, and Linux binary compatibility
-are deliberately out of scope until there's a command-line system that
+heap -> interrupts & timers -> scheduler -> user mode & syscalls ->
+per-process address space isolation (done). Next: init -> a shell ->
+VFS -> a first filesystem -> loading real user programs from disk. GUI,
+networking, package managers, and Linux binary compatibility are
+deliberately out of scope until there's a command-line system that
 boots reliably, manages memory correctly, runs isolated programs, and
 touches files.

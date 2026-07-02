@@ -3,9 +3,13 @@
 #include "scheduler.h"
 #include "heap.h"
 #include "panic.h"
+#include "vmm.h"
+#include "gdt.h"
 
 typedef struct {
     uint64_t rsp;
+    uint64_t cr3;
+    uint64_t kernel_stack_top; /* becomes TSS.RSP0 while this thread runs -- see gdt.h */
     char name[16];
 } thread_t;
 
@@ -22,7 +26,7 @@ void scheduler_init(void) {
     current_thread = -1;
 }
 
-int thread_create(const char *name, void (*entry)(void)) {
+static int thread_create_ex(const char *name, void (*entry)(void), uint64_t cr3) {
     if (thread_count >= SCHEDULER_MAX_THREADS) {
         panic("thread_create: too many threads (max %u)", SCHEDULER_MAX_THREADS);
     }
@@ -49,6 +53,14 @@ int thread_create(const char *name, void (*entry)(void)) {
 
     unsigned int id = thread_count++;
     threads[id].rsp = (uint64_t)(uintptr_t)&sp[-7];
+    threads[id].cr3 = cr3;
+    /* Reusing the same allocation as both this thread's kernel-mode
+     * stack (used by thread_trampoline/entry while it's not yet in
+     * ring 3) and its TSS.RSP0 landing stack (used if/when it later
+     * traps back into ring 0 from ring 3) is safe: a thread is never
+     * doing both at once, so nothing is ever live in both roles
+     * simultaneously. */
+    threads[id].kernel_stack_top = (uint64_t)(uintptr_t)(stack + SCHEDULER_STACK_SIZE);
 
     unsigned int i = 0;
     for (; name[i] != '\0' && i < sizeof(threads[id].name) - 1; i++) {
@@ -57,6 +69,14 @@ int thread_create(const char *name, void (*entry)(void)) {
     threads[id].name[i] = '\0';
 
     return (int)id;
+}
+
+int thread_create(const char *name, void (*entry)(void)) {
+    return thread_create_ex(name, entry, vmm_kernel_cr3());
+}
+
+int thread_create_process(const char *name, void (*entry)(void), uint64_t cr3) {
+    return thread_create_ex(name, entry, cr3);
 }
 
 void schedule(void) {
@@ -68,6 +88,9 @@ void schedule(void) {
     int next = (prev + 1) % (int)thread_count;
     current_thread = next;
 
+    vmm_load_cr3(threads[next].cr3);
+    tss_set_kernel_stack(threads[next].kernel_stack_top);
+
     uint64_t *old_rsp_slot = (prev == -1) ? &boot_rsp_unused : &threads[prev].rsp;
     switch_context(old_rsp_slot, threads[next].rsp);
 }
@@ -77,6 +100,8 @@ void scheduler_start(void) {
         panic("scheduler_start: no threads created");
     }
     current_thread = 0;
+    vmm_load_cr3(threads[0].cr3);
+    tss_set_kernel_stack(threads[0].kernel_stack_top);
     switch_context(&boot_rsp_unused, threads[0].rsp);
     panic("scheduler_start: switch_context returned to the boot stack unexpectedly");
 }

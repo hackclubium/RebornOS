@@ -40,10 +40,12 @@ static inline void load_cr3(uint64_t phys_addr) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(phys_addr) : "memory");
 }
 
+static pte_t *kernel_pml4;
+
 static pte_t *alloc_table(void) {
     void *page = pmm_alloc_page();
     if (page == 0) {
-        panic("vmm_init: out of physical memory while building page tables");
+        panic("vmm: out of physical memory while building page tables");
     }
     memset(page, 0, PMM_PAGE_SIZE);
     return (pte_t *)page;
@@ -64,12 +66,13 @@ void vmm_init(void) {
 
         for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
             uint64_t phys = (uint64_t)gib * GIB + (uint64_t)i * HUGE_PAGE_SIZE;
-            /* PAGE_USER on the whole identity map, not just where a user
-             * program happens to run: there's no per-process address
-             * space yet (see gdt.h/syscall.c), so kernel and "user"
-             * code share these exact page tables. Real process
-             * isolation -- restricting user mode to only its own
-             * pages -- is a later milestone. */
+            /* PAGE_USER on the whole identity map: this low-4GiB range
+             * is the "system" mapping every address space shares
+             * verbatim via PML4[0] (see vmm_create_address_space) --
+             * kernel code, the heap, the framebuffer, all identical
+             * for every process. Per-process isolation lives entirely
+             * in PML4[1], a separate private mapping each address
+             * space gets its own copy of. */
             pte_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_HUGE;
             if (phys >= KERNEL_EXEC_LIMIT) {
                 flags |= PAGE_NX;
@@ -78,8 +81,39 @@ void vmm_init(void) {
         }
     }
 
+    kernel_pml4 = pml4;
     load_cr3((uint64_t)(uintptr_t)pml4);
 
     kprintf("vmm: own page tables live, identity-mapped 0-%uGiB (first %luMiB executable)\n",
             IDENTITY_MAP_GIB, KERNEL_EXEC_LIMIT / (1024 * 1024));
+}
+
+uint64_t vmm_kernel_cr3(void) {
+    return (uint64_t)(uintptr_t)kernel_pml4;
+}
+
+void vmm_load_cr3(uint64_t phys_addr) {
+    load_cr3(phys_addr);
+}
+
+uint64_t vmm_create_address_space(void) {
+    pte_t *pml4 = alloc_table();
+    pml4[0] = kernel_pml4[0]; /* share the low-4GiB system mapping verbatim */
+
+    pte_t *pdpt = alloc_table();
+    pte_t *pd = alloc_table();
+    pte_t *pt = alloc_table();
+    void *private_page = pmm_alloc_page();
+    if (private_page == 0) {
+        panic("vmm_create_address_space: out of physical memory for the private page");
+    }
+    memset(private_page, 0, PMM_PAGE_SIZE);
+
+    pte_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    pt[0] = (uint64_t)(uintptr_t)private_page | flags;
+    pd[0] = (uint64_t)(uintptr_t)pt | flags;
+    pdpt[0] = (uint64_t)(uintptr_t)pd | flags;
+    pml4[1] = (uint64_t)(uintptr_t)pdpt | flags;
+
+    return (uint64_t)(uintptr_t)pml4;
 }

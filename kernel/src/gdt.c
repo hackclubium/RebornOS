@@ -57,12 +57,10 @@ typedef struct __attribute__((packed)) {
 static gdt_table_t gdt_table;
 static tss_t tss;
 
-/* Dedicated kernel stack used whenever an interrupt/exception/syscall
- * elevates from ring 3 to ring 0 (TSS.RSP0). Fixed and shared for now
- * since Milestone 3 only ever runs one ring-3 thread at a time; making
- * this per-thread (updated by the scheduler on every switch) is
- * required before multiple concurrently-preemptible ring-3 threads
- * would be safe -- they'd otherwise race on this same stack. */
+/* TSS.RSP0's initial value, before the scheduler exists to take over
+ * with tss_set_kernel_stack() per thread. Nothing runs in ring 3 this
+ * early, so this default is never actually used for a real privilege
+ * transition -- it just needs to be a valid pointer. */
 static uint8_t syscall_stack[16384] __attribute__((aligned(16)));
 
 static void gdt_set_entry(int i, uint8_t access, uint8_t flags) {
@@ -119,4 +117,8 @@ void gdt_init(void) {
 
     kprintf("gdt: own GDT + TSS loaded (kernel cs=0x%x, tss rsp0=0x%lx)\n",
             GDT_KERNEL_CODE_SEL, tss.rsp0);
+}
+
+void tss_set_kernel_stack(uint64_t rsp0) {
+    tss.rsp0 = rsp0;
 }

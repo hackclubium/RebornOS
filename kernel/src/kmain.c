@@ -48,6 +48,56 @@ static void user_thread_launcher(void) {
     enter_usermode(ring3_program, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
 }
 
+/* Two processes proving real address-space isolation: each repeatedly
+ * writes a distinct byte pattern to the exact same virtual address
+ * (PROCESS_PRIVATE_VADDR) and reads it straight back. Every process's
+ * page tables map that address to a *different* physical page (see
+ * vmm_create_address_space()), so if isolation actually holds, neither
+ * ever observes the other's value. If it didn't hold -- both somehow
+ * sharing one physical page -- one would eventually read back the
+ * wrong pattern and self-report failure via sys_exit(1) rather than
+ * silently "passing". */
+static volatile uint64_t process_a_ok = 0;
+static volatile uint64_t process_b_ok = 0;
+
+static void process_body(volatile uint64_t *ok_counter, uint8_t pattern, const char *finished_msg) {
+    volatile uint8_t *private_byte = (volatile uint8_t *)PROCESS_PRIVATE_VADDR;
+    for (int i = 0; i < 200; i++) {
+        *private_byte = pattern;
+        __asm__ volatile("pause");
+        if (*private_byte != pattern) {
+            sys_exit(1); /* isolation broken -- another process's write leaked in */
+        }
+        (*ok_counter)++;
+    }
+    sys_write(finished_msg);
+    sys_exit(0);
+}
+
+static void process_a_entry(void) {
+    process_body(&process_a_ok, 0xAA, "process A finished isolated\n");
+}
+
+static void process_b_entry(void) {
+    process_body(&process_b_ok, 0xBB, "process B finished isolated\n");
+}
+
+static void process_a_launcher(void) {
+    uint8_t *user_stack = (uint8_t *)kmalloc(SCHEDULER_STACK_SIZE);
+    if (user_stack == NULL) {
+        panic("process_a_launcher: kmalloc failed for the user stack");
+    }
+    enter_usermode(process_a_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
+}
+
+static void process_b_launcher(void) {
+    uint8_t *user_stack = (uint8_t *)kmalloc(SCHEDULER_STACK_SIZE);
+    if (user_stack == NULL) {
+        panic("process_b_launcher: kmalloc failed for the user stack");
+    }
+    enter_usermode(process_b_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
+}
+
 #ifdef REBORNOS_TEST_MODE
 /* Two worker threads that just count, plus a monitor thread that waits
  * for both to have made real progress. If the scheduler is broken --
@@ -76,15 +126,18 @@ static void worker_b(void) {
 
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
-    while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 5) {
+    while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 5 ||
+           process_a_ok < 200 || process_b_ok < 200) {
         spins++;
-        if (spins > 2000000000ULL) {
-            panic("scheduler/syscall self-test: no interleaved progress (a=%lu b=%lu syscalls=%lu)",
-                  worker_a_count, worker_b_count, syscall_write_count);
+        if (spins > 4000000000ULL) {
+            panic("scheduler/syscall/isolation self-test: no progress "
+                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu)",
+                  worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok);
         }
     }
-    kprintf("TEST MODE: scheduler+syscall self-test passed (a=%lu b=%lu syscalls=%lu)\n",
-            worker_a_count, worker_b_count, syscall_write_count);
+    kprintf("TEST MODE: scheduler+syscall+isolation self-test passed "
+            "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu)\n",
+            worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok);
     qemu_debug_exit(QEMU_DEBUG_EXIT_SUCCESS);
 }
 #else
@@ -112,7 +165,7 @@ void kmain(boot_info_t *info) {
 
     fb_init(&info->framebuffer);
     fb_clear(0x00102030);
-    fb_puts(8, 8, "REBORNOS -- MILESTONE 3: USER MODE + SYSCALLS", 0xFFFFFFFF, 0x00102030);
+    fb_puts(8, 8, "REBORNOS -- MILESTONE 4: PROCESS ISOLATION", 0xFFFFFFFF, 0x00102030);
     fb_puts(8, 24, "SERIAL + FRAMEBUFFER ALIVE.", 0xFFA0A0A0, 0x00102030);
 
     kprintf("kmain: boot checks complete\n");
@@ -212,12 +265,14 @@ void kmain(boot_info_t *info) {
     }
     kprintf("TEST MODE: heap self-test passed (%lu bytes free)\n", heap_free_bytes());
 
-    kprintf("TEST MODE: starting scheduler+syscall self-test\n");
+    kprintf("TEST MODE: starting scheduler+syscall+isolation self-test\n");
     scheduler_init();
     thread_create("worker-a", worker_a);
     thread_create("worker-b", worker_b);
     thread_create("monitor", scheduler_monitor);
     thread_create("user", user_thread_launcher);
+    thread_create_process("process-a", process_a_launcher, vmm_create_address_space());
+    thread_create_process("process-b", process_b_launcher, vmm_create_address_space());
     timer_set_tick_callback(schedule);
     scheduler_start();
     panic("kmain: scheduler_start returned -- unreachable");
@@ -232,6 +287,8 @@ void kmain(boot_info_t *info) {
     scheduler_init();
     thread_create("idle", idle_thread);
     thread_create("user", user_thread_launcher);
+    thread_create_process("process-a", process_a_launcher, vmm_create_address_space());
+    thread_create_process("process-b", process_b_launcher, vmm_create_address_space());
     timer_set_tick_callback(schedule);
     scheduler_start();
     panic("kmain: scheduler_start returned -- unreachable");
