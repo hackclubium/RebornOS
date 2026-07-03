@@ -84,18 +84,14 @@ void syscall_dispatch(interrupt_frame_t *frame) {
         case SYS_EXIT:
             /* A nonzero code means the caller is self-reporting a
              * failed check (see kmain.c's isolation test processes) --
-             * there's still no per-process fault containment, so the
-             * most honest thing to do is panic loudly rather than
-             * quietly swallow a reported failure. A clean exit now
-             * really ends the thread (see thread_exit()) instead of
-             * yielding forever in place. */
-            if ((int64_t)frame->rdi != 0) {
-                panic("syscall_dispatch: user thread reported failure, exit code %ld",
-                      (int64_t)frame->rdi);
-            }
-            kprintf("syscall: thread exited with code 0\n");
-            thread_exit();
-            break; /* unreachable -- thread_exit() never returns */
+             * now that real per-process fault containment exists (see
+             * thread_exit_code() in scheduler.c and the CPU exception
+             * handler in idt.c), the code is simply handed
+             * back to whoever's waiting (process_spawn_and_wait())
+             * instead of panicking the whole kernel over it. */
+            kprintf("syscall: thread exited with code %ld\n", (int64_t)frame->rdi);
+            thread_exit_code((int64_t)frame->rdi);
+            break; /* unreachable -- thread_exit_code() never returns */
 
         case SYS_READ_CHAR: {
             int c;

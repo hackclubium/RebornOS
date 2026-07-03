@@ -3,6 +3,8 @@
 #include "interrupts.h"
 #include "panic.h"
 #include "elf_loader.h"
+#include "scheduler.h"
+#include "kprintf.h"
 
 extern uint64_t isr_stub_table[IDT_VECTOR_COUNT];
 extern void isr_stub_128(void); /* int $0x80 -- registered directly, not part of isr_stub_table */
@@ -67,16 +69,40 @@ static const char *exception_name(uint64_t vector) {
     return (vector < 32) ? names[vector] : "Unknown";
 }
 
+/* Fault-isolation exit codes live at -1000 and below, well clear of
+ * both 0 (clean exit) and -1 (process_spawn_and_wait()'s "no such
+ * program" sentinel) and of any small nonzero code a program might
+ * legitimately pass to SYS_EXIT itself. */
+#define FAULT_EXIT_CODE(vector) (-1000 - (int64_t)(vector))
+
 static void exception_handler(interrupt_frame_t *frame) {
+    int from_ring3 = (frame->cs & 0x3) == 3;
+
     if (frame->vector == 14) {
         uint64_t fault_addr = read_cr2();
-        int from_ring3 = (frame->cs & 0x3) == 3;
         if (elf_handle_stack_fault(fault_addr, frame->error_code, from_ring3)) {
             return; /* demand-paged in -- iretq retries the faulting instruction */
+        }
+        if (from_ring3) {
+            kprintf("fault: process killed by page fault at rip=0x%lx, error_code=0x%lx, "
+                    "fault address (cr2)=0x%lx\n",
+                    frame->rip, frame->error_code, fault_addr);
+            thread_exit_code(FAULT_EXIT_CODE(frame->vector));
         }
         panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx, fault address (cr2)=0x%lx",
               frame->vector, exception_name(frame->vector), frame->rip, frame->error_code, fault_addr);
     }
+
+    /* Any other exception from ring 3 (invalid opcode, GPF, divide
+     * error, ...) ends just the offending process, not the kernel --
+     * an exception taken from ring 0 is our own bug, and stays fatal
+     * so it's never silently swallowed. */
+    if (from_ring3) {
+        kprintf("fault: process killed by CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx\n",
+                frame->vector, exception_name(frame->vector), frame->rip, frame->error_code);
+        thread_exit_code(FAULT_EXIT_CODE(frame->vector));
+    }
+
     panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx",
           frame->vector, exception_name(frame->vector), frame->rip, frame->error_code);
 }

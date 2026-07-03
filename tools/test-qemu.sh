@@ -18,10 +18,16 @@ rm -f "$BUILD/test-serial.log"
 # isn't guaranteed to flush before the timeout below SIGTERMs it on a
 # hang, which can make a real hang look like silent, contentless output.
 #
-# 40s rather than a tighter bound: CI runners have no KVM, so QEMU falls
+# 90s rather than a tighter bound: CI runners have no KVM, so QEMU falls
 # back to software emulation (TCG), which is noticeably slower through
-# OVMF's PEI/DXE/BDS phases than a KVM-accelerated local run.
-timeout 40 qemu-system-x86_64 \
+# OVMF's PEI/DXE/BDS phases than a KVM-accelerated local run. Also gives
+# real headroom to the kernel's own handful of iteration-bounded
+# busy-waits (mouse.c's PS/2 polling, smp.c's per-AP INIT-SIPI-SIPI
+# wait) -- their iteration ceilings bound *guest* work, not wall-clock
+# time, so a host that's heavily loaded or has descheduled this VM's
+# vCPU threads for a while can still stretch a normally-instant wait
+# into several real seconds without anything actually being wrong.
+timeout 90 qemu-system-x86_64 \
     -machine q35 -m 256M -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS_test.fd" \

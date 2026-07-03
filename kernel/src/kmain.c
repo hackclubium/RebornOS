@@ -306,6 +306,35 @@ static void gfxtest_thread(void) {
     thread_exit();
 }
 
+/* Proves fault isolation (idt.c's exception_handler + scheduler.c's
+ * thread_exit_code()) actually works: CRASHTST.ELF (see
+ * userland/crashtst.c) deliberately executes ud2 (a guaranteed #UD).
+ * Before this milestone, that exception would have panicked the
+ * entire kernel -- if this thread gets to run at all (let alone see a
+ * sane return value), the fault was contained to just that one
+ * process. process_spawn_and_wait() returns -1 for "program not
+ * found" and a program's own SYS_EXIT code otherwise (crashtst.c only
+ * ever passes 1, never negative) -- so anything less than -1 here can
+ * only be idt.c's synthesized fault code (see FAULT_EXIT_CODE() in
+ * idt.c), proof the process was actually killed by the #UD rather
+ * than, say, silently succeeding. */
+static volatile int crashtest_ok = 0;
+
+static void crashtest_thread(void) {
+    int ret = process_spawn_and_wait("CRASHTST.ELF", "crash-test");
+    if (ret == -1) {
+        panic("fault-isolation self-test: CRASHTST.ELF not found");
+    }
+    if (ret >= -1) {
+        panic("fault-isolation self-test: CRASHTST.ELF returned %d -- "
+              "the deliberate ud2 fault didn't kill it as a fault "
+              "(fault isolation appears broken)",
+              ret);
+    }
+    crashtest_ok = 1;
+    thread_exit();
+}
+
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
     /* syscall_write_count >= 6: ring3_program's 5 fixed writes plus
@@ -318,14 +347,14 @@ static void scheduler_monitor(void) {
     while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 6 ||
            process_a_ok < 200 || process_b_ok < 200 || exec_wait_ok < 1 ||
            subdir_test_ok < 1 || argv_test_ok < 1 || stacktest_ok < 1 || network_test_ok < 1 ||
-           smp_test_ok < 1 || gfxtest_ok < 1) {
+           smp_test_ok < 1 || gfxtest_ok < 1 || crashtest_ok < 1) {
         spins++;
         if (spins > 4000000000ULL) {
             panic("scheduler/syscall/isolation self-test: no progress "
-                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d net=%d smp=%d gfx=%d)",
+                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d net=%d smp=%d gfx=%d crash=%d)",
                   worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok,
                   exec_wait_ok, subdir_test_ok, argv_test_ok, stacktest_ok, network_test_ok, smp_test_ok,
-                  gfxtest_ok);
+                  gfxtest_ok, crashtest_ok);
         }
     }
     kprintf("TEST MODE: scheduler+syscall+isolation self-test passed "
@@ -523,6 +552,7 @@ void kmain(boot_info_t *info) {
     thread_create("network-test", network_test_thread);
     thread_create("smp-test", smp_test_thread);
     thread_create("gfx-test", gfxtest_thread);
+    thread_create("crash-test", crashtest_thread);
     boot_shell();
     timer_set_tick_callback(schedule);
     scheduler_start();

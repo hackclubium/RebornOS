@@ -34,8 +34,16 @@ int thread_create_process(const char *name, void (*entry)(void), uint64_t cr3);
  * context_switch.S) instead of taking no arguments. Needed when the
  * same launcher function is reused to start several distinct loaded
  * programs, each with its own entry point/stack (see elf_loader.h),
- * rather than a dedicated static launcher per program. */
-int thread_create_process_arg(const char *name, void (*entry)(void *arg), void *arg, uint64_t cr3);
+ * rather than a dedicated static launcher per program.
+ *
+ * `exit_code_out`, if non-NULL, receives this thread's eventual
+ * thread_exit_code() argument -- written at the moment it exits,
+ * before its slot becomes reusable. Must point at memory that outlives
+ * the thread (e.g. a waiting caller's own stack frame, as in
+ * process_spawn_and_wait()); pass NULL for a fire-and-forget thread
+ * nobody's waiting on. */
+int thread_create_process_arg(const char *name, void (*entry)(void *arg), void *arg, uint64_t cr3,
+                               int64_t *exit_code_out);
 
 /* Round-robins to the next ready thread. A no-op with 0 or 1 active
  * threads. Safe to call from within the timer ISR's call chain. */
@@ -47,6 +55,15 @@ void schedule(void);
  * the "loop yielding forever" a thread used to do on exit now that the
  * scheduler can actually remove a thread from the round-robin. */
 __attribute__((noreturn)) void thread_exit(void);
+
+/* Same as thread_exit(), but delivers `code` to whatever
+ * `exit_code_out` was given at creation time (see
+ * thread_create_process_arg()) before the slot is reaped -- thread_exit()
+ * is just thread_exit_code(0). Used by SYS_EXIT (the process's own
+ * reported code) and by the CPU-exception handler (a synthesized code
+ * identifying which fault killed it), so a crashing or misbehaving
+ * process takes down only itself, not the whole kernel. */
+__attribute__((noreturn)) void thread_exit_code(int64_t code);
 
 /* True if `tid` (an id returned by one of the thread_create* functions)
  * is still running. Lets a caller block until a spawned process

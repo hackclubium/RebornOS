@@ -21,6 +21,20 @@ typedef struct {
     uint8_t *stack_base;       /* the kmalloc() allocation kernel_stack_top points into, freed on exit */
     thread_state_t state;
     uint64_t heap_brk;         /* this thread's SYS_SBRK break -- see thread_get/set_heap_brk() */
+    /* Where to deliver this thread's exit code, or NULL for a
+     * fire-and-forget thread nobody waits on (the common case -- every
+     * plain thread_create()/thread_create_process() thread). Points
+     * into the *waiter's own stack frame* (e.g. a local in
+     * process_spawn_and_wait()), not a slot-indexed table: a slot-
+     * indexed array would need the exit code to survive from the
+     * moment of exit (immediately followed by this same slot becoming
+     * reusable, see schedule()'s zombie-reaping branch) until whenever
+     * the waiter next gets scheduled to read it -- a window some other
+     * thread_create_ex() call can and did win, silently overwriting a
+     * just-exited child's real code with an unrelated thread's. A
+     * pointer set atomically at creation time, before the thread is
+     * ever schedulable, has no such window. */
+    int64_t *exit_code_out;
     char name[16];
 } thread_t;
 
@@ -52,7 +66,8 @@ void scheduler_init(void) {
  * wrong thread is the last one alive). irq_save_disable()/irq_restore()
  * make the whole reserve-and-initialize sequence atomic; kmalloc()
  * below already nests safely with this. */
-static int thread_create_ex(const char *name, void (*entry)(void), void *arg, uint64_t cr3) {
+static int thread_create_ex(const char *name, void (*entry)(void), void *arg, uint64_t cr3,
+                             int64_t *exit_code_out) {
     uint64_t flags = irq_save_disable();
 
     int id = -1;
@@ -100,6 +115,7 @@ static int thread_create_ex(const char *name, void (*entry)(void), void *arg, ui
     threads[id].kernel_stack_top = (uint64_t)(uintptr_t)(stack + SCHEDULER_STACK_SIZE);
     threads[id].state = THREAD_ACTIVE;
     threads[id].heap_brk = USER_HEAP_VADDR_START;
+    threads[id].exit_code_out = exit_code_out;
     active_count++;
 
     unsigned int i = 0;
@@ -113,20 +129,21 @@ static int thread_create_ex(const char *name, void (*entry)(void), void *arg, ui
 }
 
 int thread_create(const char *name, void (*entry)(void)) {
-    return thread_create_ex(name, entry, NULL, vmm_kernel_cr3());
+    return thread_create_ex(name, entry, NULL, vmm_kernel_cr3(), NULL);
 }
 
 int thread_create_process(const char *name, void (*entry)(void), uint64_t cr3) {
-    return thread_create_ex(name, entry, NULL, cr3);
+    return thread_create_ex(name, entry, NULL, cr3, NULL);
 }
 
-int thread_create_process_arg(const char *name, void (*entry)(void *arg), void *arg, uint64_t cr3) {
+int thread_create_process_arg(const char *name, void (*entry)(void *arg), void *arg, uint64_t cr3,
+                               int64_t *exit_code_out) {
     /* Casting between void(*)(void) and void(*)(void*) is only safe
      * because thread_trampoline always calls through rbx as a bare
      * `call *%rbx` -- on the SysV x86-64 ABI an unused argument in rdi
      * is harmless, so the same internal storage works for both entry
      * shapes. */
-    return thread_create_ex(name, (void (*)(void))(uintptr_t)entry, arg, cr3);
+    return thread_create_ex(name, (void (*)(void))(uintptr_t)entry, arg, cr3, exit_code_out);
 }
 
 /* Finds the next ACTIVE slot after `start`, wrapping all the way
@@ -196,13 +213,20 @@ void schedule(void) {
     switch_context(&threads[prev].rsp, threads[next].rsp);
 }
 
-__attribute__((noreturn)) void thread_exit(void) {
+__attribute__((noreturn)) void thread_exit_code(int64_t code) {
     if (current_thread < 0) {
-        panic("thread_exit: called with no current thread");
+        panic("thread_exit_code: called with no current thread");
+    }
+    if (threads[current_thread].exit_code_out != NULL) {
+        *threads[current_thread].exit_code_out = code;
     }
     threads[current_thread].state = THREAD_ZOMBIE;
     schedule();
-    panic("thread_exit: schedule() returned into an exited thread");
+    panic("thread_exit_code: schedule() returned into an exited thread");
+}
+
+__attribute__((noreturn)) void thread_exit(void) {
+    thread_exit_code(0);
 }
 
 int thread_is_alive(int tid) {

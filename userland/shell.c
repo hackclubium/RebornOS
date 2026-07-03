@@ -211,8 +211,15 @@ void _start(void) {
             argv[0] = exec_name;
         }
 
-        if (sys_exec(argv, argc) != 0) {
+        long ret = sys_exec(argv, argc);
+        if (ret == -1) {
             sys_write("shell: command not found\n");
+        } else if (ret != 0) {
+            /* The kernel now contains a crash to just this one process
+             * (see idt.c's fault isolation) instead of taking the whole
+             * system down -- ret is that process's real exit/fault
+             * code, distinct from -1's "no such program". */
+            sys_write("shell: process exited with a nonzero status\n");
         }
     }
 }
