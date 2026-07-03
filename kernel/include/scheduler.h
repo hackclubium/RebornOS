@@ -3,7 +3,14 @@
 
 #include <stdint.h>
 
-#define SCHEDULER_MAX_THREADS 16u
+/* Generous headroom over the boot-time self-test roster: several test
+ * threads (exec-wait, subdir, argv, stack, network, smp, gfx-test) each
+ * call process_spawn_and_wait(), which holds BOTH the caller's slot and
+ * its spawned child's slot simultaneously while blocked -- worst-case
+ * concurrent usage is well above the persistent-thread count alone, and
+ * a tight ceiling here caused sporadic "too many threads" boot panics
+ * once enough self-tests could line up mid-flight at once. */
+#define SCHEDULER_MAX_THREADS 32u
 #define SCHEDULER_STACK_SIZE (16u * 1024u)
 
 /* Simple preemptive round-robin scheduler over a fixed table of kernel
@@ -46,6 +53,13 @@ __attribute__((noreturn)) void thread_exit(void);
  * finishes (see process_spawn_and_wait() in process.h) just by looping
  * on this and schedule() -- no separate wait queue needed. */
 int thread_is_alive(int tid);
+
+/* The currently-running thread's SYS_SBRK break (see syscall.c) --
+ * every thread gets one (initialized to USER_HEAP_VADDR_START when
+ * created), even though only ring-3 processes ever actually call
+ * SYS_SBRK; a plain kernel thread simply never touches it. */
+uint64_t thread_get_heap_brk(void);
+void thread_set_heap_brk(uint64_t brk);
 
 /* Switches from the caller's context into the first thread and never
  * returns. Call once, after creating at least one thread. */

@@ -45,7 +45,7 @@ $(BOOT_EFI): $(BOOT_OBJS)
 # ---------------------------------------------------------------------
 
 KERNEL_OBJDIR := $(BUILD)/kernel
-KERNEL_SRCS   := entry.S kmain.c serial.c minilib.c framebuffer.c font8x8.c panic.c kprintf.c qemu_debug.c pmm.c vmm.c isr_stubs.S idt.c timer.c heap.c scheduler.c context_switch.S gdt.c gdt_asm.S syscall.c fat16.c vfs.c elf_loader.c process.c keyboard.c pci.c ahci.c e1000.c net.c spinlock.c acpi.c lapic.c smp.c ap_trampoline.S
+KERNEL_SRCS   := entry.S kmain.c serial.c minilib.c framebuffer.c font8x8.c panic.c kprintf.c qemu_debug.c pmm.c vmm.c isr_stubs.S idt.c timer.c heap.c scheduler.c context_switch.S gdt.c gdt_asm.S syscall.c fat16.c vfs.c elf_loader.c process.c keyboard.c pci.c ahci.c e1000.c net.c spinlock.c acpi.c lapic.c smp.c ap_trampoline.S mouse.c
 KERNEL_OBJS   := $(addprefix $(KERNEL_OBJDIR)/,$(patsubst %.S,%.o,$(patsubst %.c,%.o,$(KERNEL_SRCS))))
 KERNEL_ELF    := $(BUILD)/kernel.elf
 
@@ -94,7 +94,7 @@ $(KERNEL_TEST_ELF): $(KERNEL_TEST_OBJS)
 # a matching userland/<name>.c to ship a new program.
 # ---------------------------------------------------------------------
 
-USER_PROGRAMS := init shell echo stacktst
+USER_PROGRAMS := init shell echo stacktst gfxtest
 USER_OBJDIR   := $(BUILD)/userland
 USER_OBJS     := $(addprefix $(USER_OBJDIR)/,$(addsuffix .o,$(USER_PROGRAMS)))
 USER_ELFS     := $(addprefix $(BUILD)/,$(addsuffix .elf,$(USER_PROGRAMS)))

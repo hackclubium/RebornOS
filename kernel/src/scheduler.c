@@ -6,6 +6,7 @@
 #include "vmm.h"
 #include "gdt.h"
 #include "interrupts.h"
+#include "elf_loader.h"
 
 typedef enum {
     THREAD_UNUSED = 0, /* free slot -- available to thread_create_ex() */
@@ -19,6 +20,7 @@ typedef struct {
     uint64_t kernel_stack_top; /* becomes TSS.RSP0 while this thread runs -- see gdt.h */
     uint8_t *stack_base;       /* the kmalloc() allocation kernel_stack_top points into, freed on exit */
     thread_state_t state;
+    uint64_t heap_brk;         /* this thread's SYS_SBRK break -- see thread_get/set_heap_brk() */
     char name[16];
 } thread_t;
 
@@ -97,6 +99,7 @@ static int thread_create_ex(const char *name, void (*entry)(void), void *arg, ui
      * simultaneously. */
     threads[id].kernel_stack_top = (uint64_t)(uintptr_t)(stack + SCHEDULER_STACK_SIZE);
     threads[id].state = THREAD_ACTIVE;
+    threads[id].heap_brk = USER_HEAP_VADDR_START;
     active_count++;
 
     unsigned int i = 0;
@@ -207,6 +210,14 @@ int thread_is_alive(int tid) {
         return 0;
     }
     return threads[tid].state == THREAD_ACTIVE;
+}
+
+uint64_t thread_get_heap_brk(void) {
+    return threads[current_thread].heap_brk;
+}
+
+void thread_set_heap_brk(uint64_t brk) {
+    threads[current_thread].heap_brk = brk;
 }
 
 void scheduler_start(void) {

@@ -38,6 +38,21 @@
 #define ELF_ARGV_MAX_ARGS 16u
 #define ELF_ARGV_MAX_TOTAL_BYTES 3072u /* generous, but bounded well within one stack page */
 
+/* Two more fixed slots in the same PML4[1] region every loaded program
+ * gets, alongside its segments and stack:
+ *
+ * USER_HEAP_VADDR_START: where SYS_SBRK (syscall.c) starts growing a
+ * process's heap upward from -- 16 MiB above the load base, comfortably
+ * past any of these small static binaries' own segments.
+ *
+ * USER_FB_VADDR: the fixed address SYS_FB_MAP (syscall.c) maps the
+ * framebuffer's physical pages into. 128 MiB above the load base, far
+ * enough past USER_HEAP_VADDR_START to leave the heap over 100 MiB of
+ * room to grow, and comfortably below ELF_USER_STACK_TOP's own growth
+ * region so neither can ever collide with the stack. */
+#define USER_HEAP_VADDR_START (ELF_USER_LOAD_BASE + 0x1000000ULL)
+#define USER_FB_VADDR (ELF_USER_LOAD_BASE + 0x8000000ULL)
+
 typedef struct {
     uint64_t entry;
     uint64_t stack_top; /* below ELF_USER_STACK_TOP by the argv blob's size, if there is one */

@@ -21,6 +21,7 @@
 #include "e1000.h"
 #include "net.h"
 #include "smp.h"
+#include "mouse.h"
 
 /* Tiny int $0x80 wrappers for the ring-3 demo program below. "+a"(ret)
  * both supplies the syscall number (via ret's initial value) and reads
@@ -278,6 +279,33 @@ static void smp_test_thread(void) {
     thread_exit();
 }
 
+/* Proves the three "graphics phase" primitives (SYS_FB_INFO/SYS_FB_MAP,
+ * SYS_MOUSE_READ, SYS_SBRK) actually work end to end: GFXTEST.ELF (see
+ * userland/gfxtest.c) maps the framebuffer and writes one specific
+ * pixel, reads the mouse state once (just to prove the syscall doesn't
+ * crash -- there's no real mouse input to assert against headlessly),
+ * and grows its heap across several pages, writing and reading back a
+ * pattern spanning all of them. This thread then double-checks the
+ * pixel write actually landed in the same physical framebuffer memory
+ * fb_read_pixel() reads -- proof the user-space mapping is real, not a
+ * private copy. */
+static volatile int gfxtest_ok = 0;
+
+static void gfxtest_thread(void) {
+    if (process_spawn_and_wait("GFXTEST.ELF", "gfx-test") != 0) {
+        panic("graphics self-test: GFXTEST.ELF not found");
+    }
+    uint32_t expected = fb_pack_color(0xABCDEFu);
+    uint32_t actual = fb_read_pixel(10, 10);
+    if (actual != expected) {
+        panic("graphics self-test: pixel (10,10) is 0x%lx, expected 0x%lx -- "
+              "SYS_FB_MAP's mapping isn't landing in real framebuffer memory",
+              (uint64_t)actual, (uint64_t)expected);
+    }
+    gfxtest_ok = 1;
+    thread_exit();
+}
+
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
     /* syscall_write_count >= 6: ring3_program's 5 fixed writes plus
@@ -290,13 +318,14 @@ static void scheduler_monitor(void) {
     while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 6 ||
            process_a_ok < 200 || process_b_ok < 200 || exec_wait_ok < 1 ||
            subdir_test_ok < 1 || argv_test_ok < 1 || stacktest_ok < 1 || network_test_ok < 1 ||
-           smp_test_ok < 1) {
+           smp_test_ok < 1 || gfxtest_ok < 1) {
         spins++;
         if (spins > 4000000000ULL) {
             panic("scheduler/syscall/isolation self-test: no progress "
-                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d net=%d smp=%d)",
+                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d net=%d smp=%d gfx=%d)",
                   worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok,
-                  exec_wait_ok, subdir_test_ok, argv_test_ok, stacktest_ok, network_test_ok, smp_test_ok);
+                  exec_wait_ok, subdir_test_ok, argv_test_ok, stacktest_ok, network_test_ok, smp_test_ok,
+                  gfxtest_ok);
         }
     }
     kprintf("TEST MODE: scheduler+syscall+isolation self-test passed "
@@ -329,7 +358,7 @@ void kmain(boot_info_t *info) {
 
     fb_init(&info->framebuffer);
     fb_clear(0x00102030);
-    fb_puts(8, 8, "REBORNOS -- MILESTONE 11: SMP", 0xFFFFFFFF, 0x00102030);
+    fb_puts(8, 8, "REBORNOS -- MILESTONE 12: GRAPHICS PRIMITIVES", 0xFFFFFFFF, 0x00102030);
     fb_puts(8, 24, "SERIAL + FRAMEBUFFER ALIVE.", 0xFFA0A0A0, 0x00102030);
 
     kprintf("kmain: boot checks complete\n");
@@ -345,6 +374,7 @@ void kmain(boot_info_t *info) {
      * it has to come after. */
     timer_init(100);
     keyboard_init();
+    mouse_init();
     heap_init();
     vfs_init();
     e1000_init();
@@ -492,6 +522,7 @@ void kmain(boot_info_t *info) {
     thread_create("stack-test", stacktest_thread);
     thread_create("network-test", network_test_thread);
     thread_create("smp-test", smp_test_thread);
+    thread_create("gfx-test", gfxtest_thread);
     boot_shell();
     timer_set_tick_callback(schedule);
     scheduler_start();

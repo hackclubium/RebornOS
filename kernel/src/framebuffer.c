@@ -52,3 +52,20 @@ void fb_puts(uint32_t x, uint32_t y, const char *s, uint32_t fg_rgb, uint32_t bg
         cursor_x += 8;
     }
 }
+
+const boot_framebuffer_t *fb_get_info(void) {
+    return &g_fb;
+}
+
+uint32_t fb_pack_color(uint32_t rgb) {
+    return pack_color(rgb);
+}
+
+uint32_t fb_read_pixel(uint32_t x, uint32_t y) {
+    if (x >= g_fb.width || y >= g_fb.height) {
+        return 0;
+    }
+    const volatile uint32_t *row =
+        (const volatile uint32_t *)(uintptr_t)(g_fb.base + (uint64_t)y * g_fb.pixels_per_scanline * g_fb.bytes_per_pixel);
+    return row[x];
+}

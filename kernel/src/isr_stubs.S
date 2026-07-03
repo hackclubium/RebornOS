@@ -60,10 +60,30 @@ ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
 
-/* IRQ0 (timer) and IRQ1 (keyboard), remapped to vectors 32/33 -- see
- * pic_remap() in timer.c */
+/* IRQ0-15, remapped to vectors 32-47 -- see pic_remap() in timer.c.
+ * Every line gets a stub even though today only IRQ0 (timer), IRQ1
+ * (keyboard), and IRQ12 (mouse) have a real handler registered (see
+ * idt_set_irq_handler()) -- interrupt_dispatch() already no-ops
+ * gracefully for an unregistered IRQ, but *every* vector a real PIC
+ * line can raise needs a valid IDT gate at all, or the CPU can't even
+ * deliver the interrupt and raises a #GP referencing the missing gate
+ * instead (exactly what happened before this existed for IRQ12). */
 ISR_NOERR 32
 ISR_NOERR 33
+ISR_NOERR 34
+ISR_NOERR 35
+ISR_NOERR 36
+ISR_NOERR 37
+ISR_NOERR 38
+ISR_NOERR 39
+ISR_NOERR 40
+ISR_NOERR 41
+ISR_NOERR 42
+ISR_NOERR 43
+ISR_NOERR 44
+ISR_NOERR 45
+ISR_NOERR 46
+ISR_NOERR 47
 
 /* Syscall vector (int $0x80). Deliberately NOT added to isr_stub_table
  * below (that table is sized/indexed for vectors 0-32 only) -- idt.c
@@ -149,3 +169,17 @@ isr_stub_table:
     .quad isr_stub_31
     .quad isr_stub_32
     .quad isr_stub_33
+    .quad isr_stub_34
+    .quad isr_stub_35
+    .quad isr_stub_36
+    .quad isr_stub_37
+    .quad isr_stub_38
+    .quad isr_stub_39
+    .quad isr_stub_40
+    .quad isr_stub_41
+    .quad isr_stub_42
+    .quad isr_stub_43
+    .quad isr_stub_44
+    .quad isr_stub_45
+    .quad isr_stub_46
+    .quad isr_stub_47

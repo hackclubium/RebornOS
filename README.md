@@ -582,7 +582,7 @@ that's the natural next step once there's a reason to need a transport
 protocol), IPv6, and anything beyond a single hardcoded IP on a single
 NIC.
 
-## Milestone 11: SMP (current)
+## Milestone 11: SMP
 
 Goal: use every CPU core QEMU gives us, not just the one UEFI hands
 off on. Discovers every core via ACPI, boots each one into 64-bit long
@@ -655,6 +655,68 @@ real spinlock coverage for the heap/page allocator/AHCI/e1000 (none of
 those are touched concurrently yet, since APs don't run real work),
 and CPU hotplug.
 
+## Milestone 12: Graphics Primitives (current)
+
+Goal: the three specific kernel-side capabilities a real GUI phase
+would otherwise be blocked on -- letting userland draw to the screen,
+telling it where the mouse is, and giving it a way to grow its own
+heap -- without yet building anything resembling a windowing system.
+
+- **`SYS_FB_INFO` / `SYS_FB_MAP`** (`kernel/src/syscall.c`): the first
+  gives a process the framebuffer's width/height/pitch/bpp; the second
+  maps the raw framebuffer physical memory directly into that
+  process's own page tables via `vmm_map_page()` -- the same primitive
+  Milestone 9 built for stack growth, reused here for MMIO-like memory
+  that isn't PMM-owned RAM at all.
+- **`kernel/src/mouse.c`**: a from-scratch PS/2 8042 mouse driver --
+  controller handshake (enable aux device, read/modify/write the
+  configuration byte, set defaults, enable data reporting), then a
+  3-byte packet state machine behind IRQ12 that maintains clamped
+  `(x, y, buttons)` state, exposed to userland via `SYS_MOUSE_READ`.
+  Two real bugs surfaced getting this working: `IDT_VECTOR_COUNT` only
+  covered vectors 0-33 (exceptions + IRQ0/1), so IRQ12 had no IDT gate
+  at all and the CPU raised a #GP the instant the mouse fired instead
+  of ever reaching the handler -- fixed by extending `isr_stubs.S` to
+  cover every IRQ line (0-47). Separately, IRQ8-15 are secondary-PIC
+  lines that only reach the CPU by cascading through the primary PIC's
+  IRQ2, which nothing had ever unmasked before (the keyboard only ever
+  needed a primary-PIC line) -- `mouse_init()` now unmasks it
+  explicitly. The whole handshake also runs under `cli`/`sti`: it
+  polls the same shared 8042 output buffer the keyboard's IRQ1 handler
+  reads from, and with interrupts already globally enabled by this
+  point in boot, a stray keystroke could otherwise steal the
+  response the handshake was waiting for.
+- **`SYS_SBRK`** (`kernel/src/syscall.c`, `thread_get/set_heap_brk()`
+  in `scheduler.c`): a per-thread heap break, growing on demand via the
+  same `pmm_alloc_page()`/`vmm_map_page()` pair Milestone 9's
+  page-fault-driven stack growth already used.
+- **A stress-test-driven fix, found after implementation looked
+  done**: a 30-run boot loop turned up two separate, genuinely flaky
+  failures neither visible in a single run. `SCHEDULER_MAX_THREADS`
+  was fixed at 16, but several self-test threads
+  (`process_spawn_and_wait()`-based) hold both their own slot and
+  their spawned child's slot simultaneously while blocked -- worst-case
+  concurrent usage was already close to that ceiling before this
+  milestone, and adding one more test thread pushed it over in a
+  fraction of scheduling interleavings. Raised to 32. Separately,
+  `mouse.c`'s PS/2 polling loops were bounded by a 100,000,000-iteration
+  spin ceiling -- generous on real hardware, but a fully unlucky
+  handshake (several such loops all maxing out under host contention
+  during a rapid back-to-back test loop) could burn tens of seconds of
+  real wall-clock time, long enough to trip `test-qemu.sh`'s 40-second
+  timeout and look exactly like a hung kernel. Lowered to 1,000,000.
+  Confirmed with 50 further clean consecutive runs across two solo
+  batches after both fixes.
+- **A new self-test** (`gfxtest_thread` in `kmain.c`, backed by
+  `userland/gfxtest.c`) exercises all three primitives in one program:
+  maps the framebuffer and writes a pixel, reads mouse state, and
+  grows its heap across multiple pages, writing and reading back
+  through the new mapping to prove it's real memory.
+
+Not yet: any actual drawing library, window management, or a way for
+more than one process to touch the framebuffer/mouse at a time --
+these are raw, single-consumer primitives, not a GUI.
+
 ## Building
 
 Everything here runs inside WSL2 (or native Linux) -- the toolchains
@@ -707,11 +769,15 @@ per-process pointer validation, and page-fault-driven stack growth ->
 networking: a polled e1000 driver plus Ethernet/ARP/ICMP, proven with a
 real ping round-trip through QEMU's NAT -> SMP: every core discovered
 via ACPI, booted through a real-mode trampoline into long mode, proven
-running in parallel (done). Next: distributing real scheduled threads
-across cores (today every AP just spins alone) is the leading
-candidate for the next big push; UDP/TCP and a minimal HTTP responder,
-piping (needs a real file-descriptor abstraction first), command
-history, and shell quoting remain smaller open items. GUI, package
-managers, and Linux binary compatibility are deliberately out of scope
-until there's a command-line system that boots reliably, manages
-memory correctly, runs isolated programs, and touches files.
+running in parallel -> graphics primitives: userland framebuffer
+mapping, a PS/2 mouse driver, and a per-thread heap-growth syscall --
+the specific blockers standing between this kernel and an actual GUI
+phase (done). Next: a few more kernel-hardening milestones before
+committing to the graphical phase in earnest; distributing real
+scheduled threads across cores (today every AP just spins alone),
+UDP/TCP and a minimal HTTP responder, piping (needs a real
+file-descriptor abstraction first), command history, and shell
+quoting remain open items. GUI, package managers, and Linux binary
+compatibility are deliberately out of scope until there's a
+command-line system that boots reliably, manages memory correctly,
+runs isolated programs, and touches files.
