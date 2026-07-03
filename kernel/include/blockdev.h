@@ -25,4 +25,8 @@ void blockdev_init(void);
  * timeout or a device error -- same reasoning as blockdev_init(). */
 void blockdev_read_sectors(uint64_t lba, uint32_t count, void *buf);
 
+/* Writes `count` consecutive 512-byte sectors starting at `lba` from
+ * buf. Same panic-on-failure reasoning as the read side. */
+void blockdev_write_sectors(uint64_t lba, uint32_t count, const void *buf);
+
 #endif /* REBORNOS_BLOCKDEV_H */

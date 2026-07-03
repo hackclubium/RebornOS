@@ -34,6 +34,17 @@ for prog in "$@"; do
     name="$(basename "$prog" .elf)"
     upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
     cp "$prog" "$ESP_DIR/${upper}.ELF"
+
+    # Also stage a copy of init.elf inside a real subdirectory, purely
+    # as a fixture for exercising subdirectory traversal (fat16.c's
+    # multi-component path resolution) and running a program that
+    # lives in one -- there's no `mkdir` support in the write path yet
+    # (see fat16.h), so this is the only way to get a subdirectory onto
+    # the ESP at all.
+    if [ "$upper" = "INIT" ]; then
+        mkdir -p "$ESP_DIR/DEMO"
+        cp "$prog" "$ESP_DIR/DEMO/HELLO.ELF"
+    fi
 done
 
 echo "staged ESP directory at $ESP_DIR"

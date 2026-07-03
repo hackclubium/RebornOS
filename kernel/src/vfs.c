@@ -32,6 +32,18 @@ int vfs_read_file(const char *path, void **out_buf, uint32_t *out_size) {
     return 1;
 }
 
-uint32_t vfs_list_root(char *buf, uint32_t max_len) {
-    return fat16_list_root(buf, max_len);
+int vfs_read_file_into(const char *path, void *buf, uint32_t max_len) {
+    fat16_file_t file;
+    if (!fat16_open(path, &file)) {
+        return -1;
+    }
+    return (int)fat16_read(&file, buf, max_len);
+}
+
+int vfs_write_file(const char *path, const void *data, uint32_t size) {
+    return fat16_write_file(path, data, size);
+}
+
+int32_t vfs_list_dir(const char *path, char *buf, uint32_t max_len) {
+    return fat16_list_dir(path, buf, max_len);
 }

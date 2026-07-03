@@ -29,8 +29,14 @@ void tss_set_kernel_stack(uint64_t rsp0);
  * user_cs, user_ds) and executes iretq, dropping into ring 3 for the
  * first time. Never returns in the normal sense -- from here on this
  * thread's kernel-mode call stack is dormant until an interrupt or
- * syscall from ring 3 reactivates it. */
+ * syscall from ring 3 reactivates it.
+ *
+ * argc/argv are handed to the new process's entry point via rdi/rsi,
+ * exactly like an ordinary SysV call -- pass 0/NULL for a process that
+ * doesn't take arguments (see elf_loader.h for how a real argv gets
+ * built for one that does). */
 __attribute__((noreturn)) void enter_usermode(void (*entry)(void), void *user_stack_top,
-                                               uint16_t user_cs, uint16_t user_ds);
+                                               uint16_t user_cs, uint16_t user_ds,
+                                               int argc, char **argv);
 
 #endif /* REBORNOS_GDT_H */

@@ -330,7 +330,7 @@ piping/redirection, or running more than one foreground program at a
 time. Those, plus real disk drivers and subdirectories from Milestone
 5's list, are all still ahead.
 
-## Milestone 7: A Real Disk Driver (current)
+## Milestone 7: A Real Disk Driver
 
 Goal: stop faking it. Every milestone since the filesystem showed up
 has been reading a one-time copy of the *entire* boot volume that the
@@ -388,10 +388,79 @@ hack and gives the kernel a real AHCI driver instead.
   disk driver were broken, everything downstream would immediately
   fail instead of needing a dedicated synthetic test.
 
-Not yet: write support, NCQ/interrupt-driven completion, more than one
-port/disk, GPT (only a legacy MBR's first partition entry is read), or
-support for any AHCI controller beyond QEMU's emulated ICH9. Real
-hardware compatibility (spin-up delays, BIOS/OS handoff) is unexplored.
+Not yet: NCQ/interrupt-driven completion, more than one port/disk, GPT
+(only a legacy MBR's first partition entry is read), or support for any
+AHCI controller beyond QEMU's emulated ICH9. Real hardware
+compatibility (spin-up delays, BIOS/OS handoff) is unexplored. Write
+support landed the very next milestone.
+
+## Milestone 8: Subdirectories, Arguments, and Write Support (current)
+
+Goal: three separate upgrades that all make the shell feel like a real
+one instead of a demo -- programs can live in folders, take arguments,
+and the disk stops being read-only.
+
+- **Subdirectories** (`kernel/src/fat16.c`): `fat16_open()` and the
+  renamed `fat16_list_dir()` now resolve multi-component paths like
+  `DEMO/HELLO.ELF`. Each non-final path component gets looked up as a
+  directory and its cluster chain read as a raw array of directory
+  entries (a subdirectory's total size isn't stored anywhere the way a
+  file's is, so this walks the chain once to count clusters, then again
+  to read them) -- everything else about scanning for an 8.3 name is
+  shared with the existing root-directory lookup via one
+  `find_entry_in_dir()` helper. Writing is still root-only (see below).
+- **Arguments**: real argv, not just a bare program name. `iretq`
+  doesn't touch general-purpose registers, so `enter_usermode()`
+  (`kernel/src/gdt_asm.S`) can set `rdi`/`rsi` to argc/argv right before
+  executing it and the new process receives them exactly like an
+  ordinary SysV call -- no crt0 startup shim needed.
+  `elf_load_user_program()` packs the argument strings plus a
+  NULL-terminated pointer array into the top of the stack page it
+  already allocates for every process, nudging the returned stack
+  pointer down below the blob so the process's own stack usage grows
+  away from it instead of into it. `SYS_EXEC`'s ABI changed from a bare
+  program-name pointer to `(argv, argc)`, matching `execv()`.
+  `userland/echo.c` is a new tiny program that exists purely to print
+  back whatever arguments it's given, proving the whole chain works.
+- **Write support** (`fat16_write_file()`, root directory only --
+  writing into a subdirectory would need growing its cluster chain,
+  deferred): allocates free clusters from the cached FAT, frees the old
+  chain first when overwriting an existing file, writes the data via a
+  new `blockdev_write_sectors()` (WRITE DMA EXT, symmetric with the
+  read side added last milestone), then writes back just the changed
+  directory-entry sector and the whole FAT cache.
+- **Three new/changed syscalls**: `SYS_LIST_DIR` (renamed from
+  `SYS_LIST_ROOT`, now takes a path), `SYS_READ_FILE`, and
+  `SYS_WRITE_FILE`. The shell gained matching builtins -- `ls [path]`,
+  `cat <file>`, `write <file> [text...]` -- plus a line tokenizer so
+  typing `echo hello world` actually splits into an argv SYS_EXEC can
+  use instead of treating the whole line as one program name.
+- **A real, if narrow, validation bug this milestone caught**: the
+  argument string SYS_EXEC's own path takes gets placed close to the
+  very top of the child's stack (that's where the argv blob lives), and
+  `user_ptr_valid()`'s check for `SYS_WRITE` conservatively required
+  256 bytes of headroom past the pointer to account for a
+  worst-case-length string -- which, for a short argv string sitting
+  near `ELF_USER_STACK_TOP`, "spilled" past that boundary on paper even
+  though the actual NUL-terminated read would stop well short of it.
+  Fixed by only requiring the pointer's *start* address to be in range
+  for that check, not the full conservative length: `kprintf`'s `%s`
+  already stops at the real NUL, and a compiler-placed buffer can't
+  itself exceed the stack it was allocated in.
+- Test mode gained three deterministic self-tests: a closed-loop
+  write-then-read-back-and-compare check (no eyeballing the serial log
+  needed), a subdirectory exec test (`DEMO/HELLO.ELF`, a copy of
+  `INIT.ELF` mkimage.sh stages into a real subdirectory purely as a
+  test fixture -- there's no `mkdir` yet), and an argv exec test
+  (`ECHO.ELF hello world`).
+
+Not yet: piping (`cmd1 | cmd2`) -- deliberately cut from this push. A
+real pipe needs a file-descriptor/stdout-redirection abstraction that
+doesn't exist anywhere in the kernel yet (`SYS_WRITE` always writes
+straight to the serial console); bolting that on as an afterthought
+here would have been worse than giving it its own milestone. Also not
+yet: quoting in the shell's tokenizer, command history, writing into
+subdirectories, and growing a directory's cluster chain when it's full.
 
 ## Building
 
@@ -439,11 +508,10 @@ heap -> interrupts & timers -> scheduler -> user mode & syscalls ->
 per-process address space isolation -> VFS + a FAT16 filesystem + an
 ELF loader for real disk-loaded programs -> a keyboard driver, real
 thread exit, and an interactive shell -> PCI enumeration and a real
-AHCI disk driver, replacing the "read the whole volume into RAM at
-boot" approach (done). Next: subdirectories, a bigger syscall surface
-(arguments, piping) as programs get more ambitious, and eventually
-write support so the disk isn't purely read-only forever. GUI,
-networking, package managers, and Linux binary compatibility are
-deliberately out of scope until there's a command-line system that
+AHCI disk driver -> subdirectories, real argv, and disk write support
+(done). Next: piping (needs a real file-descriptor abstraction first),
+command history, and shell quoting. GUI, networking, package managers,
+and Linux binary compatibility are deliberately out of scope until
+there's a command-line system that
 boots reliably, manages memory correctly, runs isolated programs, and
 touches files.

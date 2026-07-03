@@ -48,7 +48,7 @@ static void user_thread_launcher(void) {
     if (user_stack == NULL) {
         panic("user_thread_launcher: kmalloc failed for the user stack");
     }
-    enter_usermode(ring3_program, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
+    enter_usermode(ring3_program, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
 }
 
 /* Two processes proving real address-space isolation: each repeatedly
@@ -90,7 +90,7 @@ static void process_a_launcher(void) {
     if (user_stack == NULL) {
         panic("process_a_launcher: kmalloc failed for the user stack");
     }
-    enter_usermode(process_a_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
+    enter_usermode(process_a_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
 }
 
 static void process_b_launcher(void) {
@@ -98,7 +98,7 @@ static void process_b_launcher(void) {
     if (user_stack == NULL) {
         panic("process_b_launcher: kmalloc failed for the user stack");
     }
-    enter_usermode(process_b_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
+    enter_usermode(process_b_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
 }
 
 /* Boots SHELL.ELF (see userland/shell.c) the same way every other
@@ -156,6 +156,36 @@ static void exec_wait_test_thread(void) {
     thread_exit();
 }
 
+/* Proves fat16.c's subdirectory path resolution end to end: DEMO/ is a
+ * real subdirectory staged onto the ESP by mkimage.sh (containing a
+ * copy of INIT.ELF as HELLO.ELF), so this only succeeds if fat16_open()
+ * correctly walked into it rather than just searching the root. */
+static volatile int subdir_test_ok = 0;
+
+static void subdir_test_thread(void) {
+    if (process_spawn_and_wait("DEMO/HELLO.ELF", "subdir-test") != 0) {
+        panic("subdirectory self-test: DEMO/HELLO.ELF not found");
+    }
+    subdir_test_ok = 1;
+    thread_exit();
+}
+
+/* Proves argv actually reaches a separately loaded program: ECHO.ELF
+ * (see userland/echo.c) just prints back whatever arguments it was
+ * given, so a working run here means SYS_EXEC's ABI, the argv blob
+ * elf_load_user_program() writes onto the child's stack, and
+ * enter_usermode()'s rdi/rsi handoff are all correct together. */
+static volatile int argv_test_ok = 0;
+
+static void argv_test_thread(void) {
+    char *argv[] = { "ECHO.ELF", "hello", "world" };
+    if (process_spawn_args_and_wait("ECHO.ELF", "argv-test", 3, argv) != 0) {
+        panic("argv self-test: ECHO.ELF not found");
+    }
+    argv_test_ok = 1;
+    thread_exit();
+}
+
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
     /* syscall_write_count >= 6: ring3_program's 5 fixed writes plus
@@ -166,13 +196,14 @@ static void scheduler_monitor(void) {
      * to this count isn't guaranteed at any given instant, but these
      * two are). */
     while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 6 ||
-           process_a_ok < 200 || process_b_ok < 200 || exec_wait_ok < 1) {
+           process_a_ok < 200 || process_b_ok < 200 || exec_wait_ok < 1 ||
+           subdir_test_ok < 1 || argv_test_ok < 1) {
         spins++;
         if (spins > 4000000000ULL) {
             panic("scheduler/syscall/isolation self-test: no progress "
-                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d)",
+                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d)",
                   worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok,
-                  exec_wait_ok);
+                  exec_wait_ok, subdir_test_ok, argv_test_ok);
         }
     }
     kprintf("TEST MODE: scheduler+syscall+isolation self-test passed "
@@ -205,7 +236,7 @@ void kmain(boot_info_t *info) {
 
     fb_init(&info->framebuffer);
     fb_clear(0x00102030);
-    fb_puts(8, 8, "REBORNOS -- MILESTONE 6: INTERACTIVE SHELL", 0xFFFFFFFF, 0x00102030);
+    fb_puts(8, 8, "REBORNOS -- MILESTONE 8: SUBDIRS, ARGS, WRITE", 0xFFFFFFFF, 0x00102030);
     fb_puts(8, 24, "SERIAL + FRAMEBUFFER ALIVE.", 0xFFA0A0A0, 0x00102030);
 
     kprintf("kmain: boot checks complete\n");
@@ -323,6 +354,29 @@ void kmain(boot_info_t *info) {
     }
     kprintf("TEST MODE: keyboard self-test passed\n");
 
+    /* Exercise real disk writes: create a file, read it back, and
+     * confirm the bytes round-tripped exactly -- a closed-loop proof
+     * that doesn't depend on eyeballing the serial log the way the
+     * exec/subdirectory/argv self-tests below do. */
+    {
+        static const char test_data[] = "hello disk\n";
+        if (!vfs_write_file("TEST.TXT", test_data, sizeof(test_data) - 1)) {
+            panic("write self-test: vfs_write_file failed");
+        }
+        char readback[32];
+        int n = vfs_read_file_into("TEST.TXT", readback, sizeof(readback));
+        if (n != (int)(sizeof(test_data) - 1)) {
+            panic("write self-test: read back %d bytes, expected %lu", n, (uint64_t)(sizeof(test_data) - 1));
+        }
+        for (int i = 0; i < n; i++) {
+            if (readback[i] != test_data[i]) {
+                panic("write self-test: byte %d mismatch (wrote 0x%x, read 0x%x)",
+                      i, (unsigned)(uint8_t)test_data[i], (unsigned)(uint8_t)readback[i]);
+            }
+        }
+        kprintf("TEST MODE: write/read round-trip self-test passed\n");
+    }
+
     kprintf("TEST MODE: starting scheduler+syscall+isolation self-test\n");
     scheduler_init();
     thread_create("worker-a", worker_a);
@@ -332,6 +386,8 @@ void kmain(boot_info_t *info) {
     thread_create_process("process-a", process_a_launcher, vmm_create_address_space());
     thread_create_process("process-b", process_b_launcher, vmm_create_address_space());
     thread_create("exec-wait-test", exec_wait_test_thread);
+    thread_create("subdir-test", subdir_test_thread);
+    thread_create("argv-test", argv_test_thread);
     boot_shell();
     timer_set_tick_callback(schedule);
     scheduler_start();

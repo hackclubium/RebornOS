@@ -28,14 +28,23 @@ reload_segments:
 
 /*
  * void enter_usermode(void (*entry)(void), void *user_stack_top,
- *                     uint16_t user_cs, uint16_t user_ds);
- * SysV: rdi=entry, rsi=user_stack_top, rdx=user_cs, rcx=user_ds
+ *                     uint16_t user_cs, uint16_t user_ds,
+ *                     int argc, char **argv);
+ * SysV: rdi=entry, rsi=user_stack_top, rdx=user_cs, rcx=user_ds, r8=argc, r9=argv
  *
  * `iretq` only reloads CS and SS itself; the other data segment
  * registers need an explicit mov first. Building [[SS][RSP][RFLAGS]
  * [CS][RIP]] on the stack and executing iretq is the standard way to
  * enter a lower privilege level for the first time (there's no other
  * instruction that can drop CPL going down).
+ *
+ * iretq does not touch general-purpose registers, only RIP/CS/RFLAGS/
+ * RSP/SS -- so setting rdi/rsi to argc/argv right before it executes
+ * means the new process's entry point receives them exactly like an
+ * ordinary SysV call (rdi=argc, rsi=argv), no special-cased startup
+ * code needed. Callers with no arguments (every ring-3 demo thread
+ * baked into the kernel image) just pass argc=0, argv=NULL, which an
+ * entry point declared to take no parameters simply never reads.
  */
 .global enter_usermode
 enter_usermode:
@@ -52,4 +61,6 @@ enter_usermode:
     push %rax        /* RFLAGS */
     push %rdx        /* CS = user_cs */
     push %rdi        /* RIP = entry */
+    mov %r8, %rdi    /* child's argc */
+    mov %r9, %rsi    /* child's argv */
     iretq

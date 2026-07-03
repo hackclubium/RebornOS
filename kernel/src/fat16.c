@@ -44,9 +44,13 @@ typedef struct __attribute__((packed)) {
     uint32_t file_size;
 } fat16_dirent_t;
 
-#define ATTR_LONG_NAME 0x0Fu /* LFN entry -- we only support 8.3 names, skip these */
-#define ATTR_VOLUME_ID 0x08u
-#define FAT16_EOC_MIN  0xFFF8u /* cluster values >= this mean "end of chain" */
+#define ATTR_LONG_NAME  0x0Fu /* LFN entry -- we only support 8.3 names, skip these */
+#define ATTR_VOLUME_ID  0x08u
+#define ATTR_DIRECTORY  0x10u
+#define ATTR_ARCHIVE    0x20u
+#define FAT16_EOC_MIN   0xFFF8u /* cluster values >= this mean "end of chain" when reading */
+#define FAT16_EOC_MARK  0xFFFFu /* the value we write to mark a chain's last cluster */
+#define FAT16_FREE_MARK 0x0000u
 
 static struct {
     uint64_t partition_lba;    /* absolute LBA the FAT16 volume starts at -- see fat16_init() */
@@ -58,16 +62,20 @@ static struct {
     uint32_t root_dir_sectors;
     uint32_t root_dir_entry_count;
     uint32_t first_data_sector;
-    uint16_t *fat_cache;       /* the whole first FAT, read once at init */
+    uint16_t *fat_cache;       /* the whole first FAT, read once at init, mutated in place on write */
     uint32_t fat_cache_entries;
 } fs;
 
 /* Every sector number computed from the BPB (fat_start_sector,
  * root_dir_start_sector, data clusters, ...) is relative to the start
- * of the FAT16 volume itself -- but the block device reads in
- * absolute disk LBAs, so every read needs partition_lba added first. */
+ * of the FAT16 volume itself -- but the block device reads/writes in
+ * absolute disk LBAs, so every access needs partition_lba added first. */
 static void read_sectors(uint32_t volume_relative_lba, uint32_t count, void *buf) {
     blockdev_read_sectors(fs.partition_lba + volume_relative_lba, count, buf);
+}
+
+static void write_sectors(uint32_t volume_relative_lba, uint32_t count, const void *buf) {
+    blockdev_write_sectors(fs.partition_lba + volume_relative_lba, count, buf);
 }
 
 static uint32_t cluster_to_sector(uint32_t cluster) {
@@ -184,22 +192,65 @@ static uint8_t *read_root_dir(void) {
     return buf;
 }
 
-int fat16_open(const char *name, fat16_file_t *out) {
-    uint8_t want[11];
-    format_83(name, want);
+/* Reads a subdirectory's entire cluster chain into a freshly kmalloc'd
+ * buffer -- unlike the root directory, a subdirectory's size isn't
+ * stored anywhere, so this walks the chain once to count clusters,
+ * then again to actually read them. Directories are small enough in
+ * practice that this two-pass approach is simpler than growing a
+ * buffer incrementally. Caller must kfree() the result. */
+static uint8_t *read_subdir_clusters(uint32_t first_cluster, uint32_t *out_total_bytes) {
+    uint32_t count = 0;
+    for (uint32_t c = first_cluster; c >= 2 && c < FAT16_EOC_MIN; c = fat_next_cluster(c)) {
+        count++;
+    }
 
-    uint8_t *root = read_root_dir();
+    uint32_t total = count * fs.cluster_size_bytes;
+    uint8_t *buf = (uint8_t *)kmalloc(total);
+    if (buf == NULL) {
+        panic("fat16: kmalloc failed for a %lu-byte directory buffer", (uint64_t)total);
+    }
+
+    uint8_t *dst = buf;
+    for (uint32_t c = first_cluster; c >= 2 && c < FAT16_EOC_MIN; c = fat_next_cluster(c)) {
+        read_sectors(cluster_to_sector(c), fs.sectors_per_cluster, dst);
+        dst += fs.cluster_size_bytes;
+    }
+
+    *out_total_bytes = total;
+    return buf;
+}
+
+/* dir_cluster == 0 is the sentinel for "the root directory" (real data
+ * clusters start at 2, so 0 can never collide with one). Fills
+ * *out_entry_count and returns a kmalloc'd buffer the caller must
+ * kfree(). */
+static uint8_t *read_directory(uint32_t dir_cluster, uint32_t *out_entry_count) {
+    if (dir_cluster == 0) {
+        *out_entry_count = fs.root_dir_entry_count;
+        return read_root_dir();
+    }
+    uint32_t total_bytes;
+    uint8_t *buf = read_subdir_clusters(dir_cluster, &total_bytes);
+    *out_entry_count = total_bytes / (uint32_t)sizeof(fat16_dirent_t);
+    return buf;
+}
+
+/* Scans a directory (see read_directory()) for an 8.3 name, skipping
+ * deleted entries, LFN fragments, and the volume label. Returns 1 and
+ * copies the matching entry into *out on success. */
+static int find_entry_in_dir(uint32_t dir_cluster, const uint8_t want[11], fat16_dirent_t *out) {
+    uint32_t entry_count;
+    uint8_t *dirbuf = read_directory(dir_cluster, &entry_count);
     int found = 0;
 
-    for (uint32_t e = 0; e < fs.root_dir_entry_count; e++) {
-        const fat16_dirent_t *de = (const fat16_dirent_t *)(root + e * sizeof(fat16_dirent_t));
+    for (uint32_t e = 0; e < entry_count; e++) {
+        const fat16_dirent_t *de = (const fat16_dirent_t *)(dirbuf + e * sizeof(fat16_dirent_t));
         if (de->name[0] == 0x00) {
             break; /* first byte 0x00 marks the end of the directory */
         }
         if (de->name[0] == 0xE5 || de->attr == ATTR_LONG_NAME || (de->attr & ATTR_VOLUME_ID)) {
-            continue; /* deleted entry, LFN fragment, or the volume label */
+            continue;
         }
-
         int match = 1;
         for (int i = 0; i < 11; i++) {
             if (de->name[i] != want[i]) {
@@ -208,15 +259,115 @@ int fat16_open(const char *name, fat16_file_t *out) {
             }
         }
         if (match) {
-            out->first_cluster = ((uint32_t)de->first_cluster_hi << 16) | de->first_cluster_lo;
-            out->size = de->file_size;
+            *out = *de;
             found = 1;
             break;
         }
     }
 
-    kfree(root);
+    kfree(dirbuf);
     return found;
+}
+
+/* Splits `path` on '/' and, for every component except the last,
+ * resolves it as a subdirectory of the directory found so far
+ * (starting at root). Fills *out_dir_cluster with the cluster of the
+ * directory that should contain the final component, and leaf_out
+ * (>= 13 bytes) with that final component. Returns 0 if any
+ * intermediate component doesn't exist or isn't a directory. */
+static int resolve_parent_dir(const char *path, uint32_t *out_dir_cluster, char leaf_out[13]) {
+    uint32_t current_dir = 0; /* root */
+    const char *p = path;
+
+    for (;;) {
+        char component[13];
+        int ci = 0;
+        while (*p != '\0' && *p != '/' && ci < 12) {
+            component[ci++] = *p++;
+        }
+        component[ci] = '\0';
+        while (*p == '/') {
+            p++;
+        }
+
+        if (*p == '\0') {
+            *out_dir_cluster = current_dir;
+            for (int i = 0; i <= ci; i++) {
+                leaf_out[i] = component[i];
+            }
+            return 1;
+        }
+
+        uint8_t want[11];
+        format_83(component, want);
+        fat16_dirent_t entry;
+        if (!find_entry_in_dir(current_dir, want, &entry) || !(entry.attr & ATTR_DIRECTORY)) {
+            return 0;
+        }
+        current_dir = ((uint32_t)entry.first_cluster_hi << 16) | entry.first_cluster_lo;
+    }
+}
+
+/* Like resolve_parent_dir(), but resolves every component (including
+ * the last) as a directory -- for listing a directory itself rather
+ * than finding a file inside one. An empty path means the root. */
+static int resolve_directory(const char *path, uint32_t *out_cluster) {
+    if (path == NULL || path[0] == '\0') {
+        *out_cluster = 0;
+        return 1;
+    }
+
+    uint32_t current_dir = 0;
+    const char *p = path;
+
+    for (;;) {
+        char component[13];
+        int ci = 0;
+        while (*p != '\0' && *p != '/' && ci < 12) {
+            component[ci++] = *p++;
+        }
+        component[ci] = '\0';
+        while (*p == '/') {
+            p++;
+        }
+
+        if (ci == 0) { /* trailing slash */
+            *out_cluster = current_dir;
+            return 1;
+        }
+
+        uint8_t want[11];
+        format_83(component, want);
+        fat16_dirent_t entry;
+        if (!find_entry_in_dir(current_dir, want, &entry) || !(entry.attr & ATTR_DIRECTORY)) {
+            return 0;
+        }
+        current_dir = ((uint32_t)entry.first_cluster_hi << 16) | entry.first_cluster_lo;
+
+        if (*p == '\0') {
+            *out_cluster = current_dir;
+            return 1;
+        }
+    }
+}
+
+int fat16_open(const char *path, fat16_file_t *out) {
+    uint32_t dir_cluster;
+    char leaf[13];
+    if (!resolve_parent_dir(path, &dir_cluster, leaf)) {
+        return 0;
+    }
+
+    uint8_t want[11];
+    format_83(leaf, want);
+    fat16_dirent_t entry;
+    if (!find_entry_in_dir(dir_cluster, want, &entry)) {
+        return 0;
+    }
+
+    out->first_cluster = ((uint32_t)entry.first_cluster_hi << 16) | entry.first_cluster_lo;
+    out->size = entry.file_size;
+    return 1;
 }
 
 uint32_t fat16_read(const fat16_file_t *file, void *buf, uint32_t max_len) {
@@ -243,12 +394,18 @@ uint32_t fat16_read(const fat16_file_t *file, void *buf, uint32_t max_len) {
     return total - remaining;
 }
 
-uint32_t fat16_list_root(char *buf, uint32_t max_len) {
-    uint8_t *root = read_root_dir();
+int32_t fat16_list_dir(const char *path, char *buf, uint32_t max_len) {
+    uint32_t dir_cluster;
+    if (!resolve_directory(path, &dir_cluster)) {
+        return -1;
+    }
+
+    uint32_t entry_count;
+    uint8_t *dirbuf = read_directory(dir_cluster, &entry_count);
     uint32_t written = 0;
 
-    for (uint32_t e = 0; e < fs.root_dir_entry_count; e++) {
-        const fat16_dirent_t *de = (const fat16_dirent_t *)(root + e * sizeof(fat16_dirent_t));
+    for (uint32_t e = 0; e < entry_count; e++) {
+        const fat16_dirent_t *de = (const fat16_dirent_t *)(dirbuf + e * sizeof(fat16_dirent_t));
         if (de->name[0] == 0x00) {
             break;
         }
@@ -276,10 +433,131 @@ uint32_t fat16_list_root(char *buf, uint32_t max_len) {
         written += li;
     }
 
-    kfree(root);
+    kfree(dirbuf);
 
     if (max_len > 0) {
         buf[written < max_len ? written : max_len - 1] = '\0';
     }
-    return written;
+    return (int32_t)written;
+}
+
+static uint32_t alloc_cluster(void) {
+    for (uint32_t c = 2; c < fs.fat_cache_entries; c++) {
+        if (fs.fat_cache[c] == FAT16_FREE_MARK) {
+            return c;
+        }
+    }
+    panic("fat16: disk full (no free clusters)");
+}
+
+static void write_fat_cache_to_disk(void) {
+    uint32_t fat_bytes = fs.fat_cache_entries * 2;
+    uint32_t fat_sectors = fat_bytes / fs.bytes_per_sector; /* exact -- came from a whole-sector read at init */
+    write_sectors(fs.fat_start_sector, fat_sectors, fs.fat_cache);
+}
+
+int fat16_write_file(const char *name, const void *data, uint32_t size) {
+    uint8_t want[11];
+    format_83(name, want);
+
+    uint8_t *root = read_root_dir();
+
+    /* Find an existing entry with this name (to overwrite -- its old
+     * clusters get freed below) or, failing that, the first free slot
+     * (a deleted entry, or the boundary marking "never used" beyond). */
+    int existing_index = -1;
+    int free_index = -1;
+    for (uint32_t e = 0; e < fs.root_dir_entry_count; e++) {
+        const fat16_dirent_t *de = (const fat16_dirent_t *)(root + e * sizeof(fat16_dirent_t));
+        if (de->name[0] == 0x00) {
+            if (free_index < 0) {
+                free_index = (int)e;
+            }
+            break;
+        }
+        if (de->name[0] == 0xE5) {
+            if (free_index < 0) {
+                free_index = (int)e;
+            }
+            continue;
+        }
+        if (de->attr == ATTR_LONG_NAME || (de->attr & ATTR_VOLUME_ID)) {
+            continue;
+        }
+        int match = 1;
+        for (int i = 0; i < 11; i++) {
+            if (de->name[i] != want[i]) {
+                match = 0;
+                break;
+            }
+        }
+        if (match) {
+            existing_index = (int)e;
+            break;
+        }
+    }
+
+    int slot = existing_index >= 0 ? existing_index : free_index;
+    if (slot < 0) {
+        kfree(root);
+        panic("fat16_write_file: root directory is full");
+    }
+
+    if (existing_index >= 0) {
+        const fat16_dirent_t *de = (const fat16_dirent_t *)(root + (uint32_t)existing_index * sizeof(fat16_dirent_t));
+        uint32_t old_cluster = ((uint32_t)de->first_cluster_hi << 16) | de->first_cluster_lo;
+        while (old_cluster >= 2 && old_cluster < FAT16_EOC_MIN) {
+            uint32_t next = fs.fat_cache[old_cluster];
+            fs.fat_cache[old_cluster] = FAT16_FREE_MARK;
+            old_cluster = next;
+        }
+    }
+
+    uint32_t clusters_needed = size == 0 ? 0 : (size + fs.cluster_size_bytes - 1) / fs.cluster_size_bytes;
+    uint32_t first_cluster = 0;
+    uint32_t prev_cluster = 0;
+    const uint8_t *src = (const uint8_t *)data;
+    uint32_t remaining = size;
+    uint8_t *cluster_buf = clusters_needed > 0 ? (uint8_t *)kmalloc(fs.cluster_size_bytes) : NULL;
+
+    for (uint32_t i = 0; i < clusters_needed; i++) {
+        uint32_t c = alloc_cluster();
+        fs.fat_cache[c] = (uint16_t)FAT16_EOC_MARK; /* provisional -- overwritten below if another cluster follows */
+        if (prev_cluster == 0) {
+            first_cluster = c;
+        } else {
+            fs.fat_cache[prev_cluster] = (uint16_t)c;
+        }
+        prev_cluster = c;
+
+        uint32_t chunk = fs.cluster_size_bytes < remaining ? fs.cluster_size_bytes : remaining;
+        memset(cluster_buf, 0, fs.cluster_size_bytes);
+        memcpy(cluster_buf, src, chunk);
+        write_sectors(cluster_to_sector(c), fs.sectors_per_cluster, cluster_buf);
+
+        src += chunk;
+        remaining -= chunk;
+    }
+    if (cluster_buf != NULL) {
+        kfree(cluster_buf);
+    }
+
+    fat16_dirent_t *de = (fat16_dirent_t *)(root + (uint32_t)slot * sizeof(fat16_dirent_t));
+    memset(de, 0, sizeof(*de));
+    memcpy(de->name, want, 11);
+    de->attr = ATTR_ARCHIVE;
+    de->first_cluster_hi = (uint16_t)(first_cluster >> 16);
+    de->first_cluster_lo = (uint16_t)(first_cluster & 0xFFFF);
+    de->file_size = size;
+
+    /* Only the sector containing this one directory entry actually
+     * changed -- write that back, plus the FAT cache (mutated above by
+     * freeing the old chain and/or allocating a new one). */
+    uint32_t entries_per_sector = fs.bytes_per_sector / (uint32_t)sizeof(fat16_dirent_t);
+    uint32_t sector_index = (uint32_t)slot / entries_per_sector;
+    write_sectors(fs.root_dir_start_sector + sector_index, 1, root + sector_index * fs.bytes_per_sector);
+    write_fat_cache_to_disk();
+
+    kfree(root);
+    return 1;
 }

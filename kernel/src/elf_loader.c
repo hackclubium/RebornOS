@@ -16,7 +16,60 @@ static uint64_t page_align_up(uint64_t x) {
     return (x + PMM_PAGE_SIZE - 1) & ~(uint64_t)(PMM_PAGE_SIZE - 1);
 }
 
-void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t pml4_phys, elf_process_t *out) {
+/* Packs argc strings plus a NULL-terminated pointer array into the top
+ * of the topmost stack page (whose physical/virtual address the caller
+ * already knows, having just allocated and mapped it) and returns the
+ * new stack top -- pushed down below the blob so the process's own
+ * stack usage grows away from it instead of into it. Returns
+ * ELF_USER_STACK_TOP unchanged and *out_argv_ptr = 0 when argc is 0. */
+static uint64_t write_argv_blob(void *top_page_phys, uint64_t top_page_vaddr,
+                                 int argc, char **argv, uint64_t *out_argv_ptr) {
+    if (argc <= 0) {
+        *out_argv_ptr = 0;
+        return ELF_USER_STACK_TOP;
+    }
+    if ((uint32_t)argc > ELF_ARGV_MAX_ARGS) {
+        panic("elf_load_user_program: too many arguments (%d, max %u)", argc, ELF_ARGV_MAX_ARGS);
+    }
+
+    uint64_t lengths[ELF_ARGV_MAX_ARGS];
+    uint64_t total_string_bytes = 0;
+    for (int i = 0; i < argc; i++) {
+        lengths[i] = strlen(argv[i]) + 1;
+        total_string_bytes += lengths[i];
+    }
+
+    uint64_t string_area_bytes = (total_string_bytes + 7) & ~7ULL; /* keep the pointer array 8-byte aligned */
+    uint64_t pointer_array_bytes = (uint64_t)(argc + 1) * sizeof(char *);
+    uint64_t blob_bytes = string_area_bytes + pointer_array_bytes;
+    if (blob_bytes > ELF_ARGV_MAX_TOTAL_BYTES) {
+        panic("elf_load_user_program: argv too large (%lu bytes, max %u)",
+              (uint64_t)blob_bytes, ELF_ARGV_MAX_TOTAL_BYTES);
+    }
+    blob_bytes = (blob_bytes + 15) & ~15ULL; /* keep the resulting stack top 16-byte aligned */
+
+    uint64_t blob_vaddr = ELF_USER_STACK_TOP - blob_bytes;
+    uint8_t *blob_phys = (uint8_t *)top_page_phys + (blob_vaddr - top_page_vaddr);
+
+    uint8_t *string_dst = blob_phys;
+    uint64_t string_vaddr = blob_vaddr;
+    uint64_t *ptr_array = (uint64_t *)(blob_phys + string_area_bytes);
+    uint64_t ptr_array_vaddr = blob_vaddr + string_area_bytes;
+
+    for (int i = 0; i < argc; i++) {
+        memcpy(string_dst, argv[i], lengths[i]);
+        ptr_array[i] = string_vaddr;
+        string_dst += lengths[i];
+        string_vaddr += lengths[i];
+    }
+    ptr_array[argc] = 0; /* argv[argc] == NULL, matching the usual C convention */
+
+    *out_argv_ptr = ptr_array_vaddr;
+    return blob_vaddr;
+}
+
+void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t pml4_phys,
+                            int argc, char **argv, elf_process_t *out) {
     if (elf_size < sizeof(Elf64_Ehdr)) {
         panic("elf_load_user_program: file too small to hold an ELF header");
     }
@@ -76,6 +129,9 @@ void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t 
         }
     }
 
+    void *top_page_phys = NULL;
+    uint64_t top_page_vaddr = 0;
+
     for (uint32_t i = 0; i < ELF_USER_STACK_PAGES; i++) {
         void *phys = pmm_alloc_page();
         if (phys == 0) {
@@ -84,17 +140,28 @@ void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t 
         memset(phys, 0, PMM_PAGE_SIZE);
         uint64_t vaddr = ELF_USER_STACK_TOP - (uint64_t)(i + 1) * PMM_PAGE_SIZE;
         vmm_map_page(pml4_phys, vaddr, (uint64_t)(uintptr_t)phys, VMM_MAP_WRITE);
+        if (i == 0) {
+            top_page_phys = phys;
+            top_page_vaddr = vaddr;
+        }
     }
 
+    uint64_t argv_ptr = 0;
+    uint64_t stack_top = write_argv_blob(top_page_phys, top_page_vaddr, argc, argv, &argv_ptr);
+
     out->entry = ehdr->e_entry;
-    out->stack_top = ELF_USER_STACK_TOP;
+    out->stack_top = stack_top;
+    out->argv_ptr = argv_ptr;
+    out->argc = argc;
 }
 
 __attribute__((noreturn)) void elf_launch_process(void *arg) {
     elf_process_t *proc = (elf_process_t *)arg;
     uint64_t entry = proc->entry;
     uint64_t stack_top = proc->stack_top;
+    int argc = proc->argc;
+    uint64_t argv_ptr = proc->argv_ptr;
     kfree(proc);
     enter_usermode((void (*)(void))(uintptr_t)entry, (void *)(uintptr_t)stack_top,
-                   GDT_USER_CODE_SEL, GDT_USER_DATA_SEL);
+                   GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, argc, (char **)(uintptr_t)argv_ptr);
 }

@@ -20,9 +20,20 @@
 #define ELF_USER_STACK_TOP 0x0000008010000000ULL
 #define ELF_USER_STACK_PAGES 4u /* 16 KiB */
 
+/* argc/argv, when requested, get packed into the top of the stack page
+ * this loader already allocates -- a handful of short strings plus a
+ * pointer array easily fits in one 4KiB page alongside the modest
+ * amount of real stack usage these small programs ever need. See
+ * elf_load_user_program()'s scope note. */
+#define ELF_ARGV_MAX_ARGS 16u
+#define ELF_ARGV_MAX_TOTAL_BYTES 3072u /* generous, but bounded well within one stack page */
+
 typedef struct {
     uint64_t entry;
-    uint64_t stack_top;
+    uint64_t stack_top; /* below ELF_USER_STACK_TOP by the argv blob's size, if there is one */
+    uint64_t argv_ptr;  /* virtual address (in the *child's* address space) of a NULL-terminated
+                          * char* array -- 0 if argc was 0 */
+    int argc;
 } elf_process_t;
 
 /* Parses elf_data (elf_size bytes, already read fully into a kernel
@@ -32,8 +43,16 @@ typedef struct {
  * entry point and stack top ready to hand to enter_usermode(). Panics
  * on a malformed ELF -- our own toolchain produced this file, so a bad
  * header means something is fundamentally broken, not a case to
- * recover from gracefully. */
-void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t pml4_phys, elf_process_t *out);
+ * recover from gracefully.
+ *
+ * argv is a kernel-side array of argc NUL-terminated strings (already
+ * copied out of whatever process asked for this one to be spawned --
+ * see syscall.c's SYS_EXEC); pass argc=0, argv=NULL for a process that
+ * takes no arguments. The strings get copied into the *new* process's
+ * own stack memory before it ever runs, so the caller's copies don't
+ * need to outlive this call. */
+void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t pml4_phys,
+                            int argc, char **argv, elf_process_t *out);
 
 /* Thread entry point for a freshly spawned process (see process.h):
  * takes ownership of `arg` (an elf_process_t* from
