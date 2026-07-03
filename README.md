@@ -462,7 +462,7 @@ here would have been worse than giving it its own milestone. Also not
 yet: quoting in the shell's tokenizer, command history, writing into
 subdirectories, and growing a directory's cluster chain when it's full.
 
-## Milestone 9: Real Virtual Memory (current)
+## Milestone 9: Real Virtual Memory
 
 Goal: close the gap between "process isolation" as a demo and process
 isolation as something actually enforced. Every process has had its own
@@ -530,6 +530,58 @@ Not yet: demand-paged heap growth for user programs (none of today's
 programs need one), copy-on-write, swapping, or any notion of memory
 outside a process's fixed load region and its one growable stack.
 
+## Milestone 10: Networking (current)
+
+Goal: RebornOS talks to the outside world. A polled Intel 82540EM
+("e1000") driver -- QEMU's default emulated NIC -- plus just enough of
+a network stack (Ethernet framing, ARP, ICMP echo) to send and receive
+real packets through QEMU's user-mode (SLIRP) NAT, proven by actually
+pinging the gateway and getting a real reply back.
+
+- **`kernel/src/e1000.c`**: same shape as `ahci.c` -- finds the card via
+  PCI (class 0x02 network, subclass 0x00 ethernet), enables memory
+  space + bus mastering, maps BAR0, resets the device, and reads our
+  own MAC straight back out of `RAL0`/`RAH0` (QEMU pre-populates those
+  from `-device e1000,mac=...`, so no EEPROM read protocol was needed).
+  Builds a small 8-descriptor RX ring and 8-descriptor TX ring (one
+  physical page each, trivially satisfying the 128-byte alignment
+  requirement -- same reasoning as `ahci.c`'s command structures),
+  masks every interrupt (this driver is polled, like the disk driver),
+  and exposes three functions: `e1000_send()` (blocks on the TX
+  descriptor's Descriptor Done bit), `e1000_poll_receive()`
+  (non-blocking, returns 0 if nothing's arrived), and
+  `e1000_get_mac()`.
+- **`kernel/src/net.c`**: the thinnest stack that could prove this
+  works -- Ethernet framing, ARP request/reply, and ICMP echo, nothing
+  else. No DHCP: our own IP is a hardcoded constant matching what QEMU's
+  SLIRP network would hand out anyway (`10.0.2.15`, gateway `10.0.2.2`),
+  since implementing a DHCP client purely to arrive at the same fixed
+  value the test network always uses wasn't worth it yet.
+  `net_arp_resolve()` and `net_ping()` both retry a bounded number of
+  times while polling for a reply and return 0 on timeout rather than
+  panicking -- a dropped frame or slow reply is a normal, expected
+  condition here, not a kernel bug; the caller decides whether that
+  failure matters.
+- **A new self-test** (`network_test_thread` in `kmain.c`) that ARPs for
+  the gateway's MAC, then sends it a real ICMP echo request and checks
+  for a matching reply (same identifier, sequence, and payload) --
+  QEMU's SLIRP gateway answers both like a real host would, so this
+  only passes if frames genuinely left the card, got NATed, and the
+  driver's RX path delivered the reply back.
+- **`memcmp` added to `common/src/minilib.c`**: net.c's reply-matching
+  needed real buffer comparison, which this freestanding libc didn't
+  have yet (only `memset`/`memcpy`/`memmove`/`strlen`/`strcmp`
+  existed).
+- All three QEMU scripts (`run-qemu.sh`, `test-qemu.sh`,
+  `debug-qemu.sh`) gained `-netdev user,id=net0 -device e1000,...` --
+  SLIRP's NAT needs no host root privileges or tap device setup, so
+  `make test` stays a fully scriptable, no-special-privileges command.
+
+Not yet: DHCP, UDP/TCP (so no real sockets or an HTTP server yet --
+that's the natural next step once there's a reason to need a transport
+protocol), IPv6, and anything beyond a single hardcoded IP on a single
+NIC.
+
 ## Building
 
 Everything here runs inside WSL2 (or native Linux) -- the toolchains
@@ -578,11 +630,12 @@ ELF loader for real disk-loaded programs -> a keyboard driver, real
 thread exit, and an interactive shell -> PCI enumeration and a real
 AHCI disk driver -> subdirectories, real argv, and disk write support
 -> real virtual memory: a genuinely ring-0-only kernel mapping, real
-per-process pointer validation, and page-fault-driven stack growth
-(done). Next: networking (a driver plus a minimal TCP/IP stack) is the
-leading candidate for the next big milestone; piping (needs a real
-file-descriptor abstraction first), command history, and shell quoting
-remain smaller open items. GUI, package managers, and Linux binary
-compatibility are deliberately out of scope until there's a
-command-line system that boots reliably, manages memory correctly,
-runs isolated programs, and touches files.
+per-process pointer validation, and page-fault-driven stack growth ->
+networking: a polled e1000 driver plus Ethernet/ARP/ICMP, proven with a
+real ping round-trip through QEMU's NAT (done). Next: UDP/TCP and a
+minimal HTTP responder are the leading candidates for the next big
+push; piping (needs a real file-descriptor abstraction first), command
+history, and shell quoting remain smaller open items. GUI, package
+managers, and Linux binary compatibility are deliberately out of scope
+until there's a command-line system that boots reliably, manages
+memory correctly, runs isolated programs, and touches files.

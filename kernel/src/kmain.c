@@ -18,6 +18,8 @@
 #include "keyboard.h"
 #include "process.h"
 #include "minilib.h"
+#include "e1000.h"
+#include "net.h"
 
 /* Tiny int $0x80 wrappers for the ring-3 demo program below. "+a"(ret)
  * both supplies the syscall number (via ret's initial value) and reads
@@ -217,6 +219,26 @@ static void stacktest_thread(void) {
     thread_exit();
 }
 
+/* Proves the e1000 driver and net.c's ARP/ICMP actually work end to
+ * end over real (emulated) hardware: QEMU's SLIRP user-mode networking
+ * runs its own gateway at NET_GATEWAY_IP that answers ARP and ICMP
+ * echo like a real host would, so a successful round trip here only
+ * happens if frames genuinely left the card, SLIRP's NAT replied, and
+ * the driver's RX path delivered that reply back to us. */
+static volatile int network_test_ok = 0;
+
+static void network_test_thread(void) {
+    uint8_t gateway_mac[6];
+    if (!net_arp_resolve(NET_GATEWAY_IP, gateway_mac)) {
+        panic("network self-test: ARP request to the gateway (10.0.2.2) never got a reply");
+    }
+    if (!net_ping(NET_GATEWAY_IP, gateway_mac, 0x1234, 1)) {
+        panic("network self-test: ICMP echo request to the gateway never got a reply");
+    }
+    network_test_ok = 1;
+    thread_exit();
+}
+
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
     /* syscall_write_count >= 6: ring3_program's 5 fixed writes plus
@@ -228,13 +250,13 @@ static void scheduler_monitor(void) {
      * two are). */
     while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 6 ||
            process_a_ok < 200 || process_b_ok < 200 || exec_wait_ok < 1 ||
-           subdir_test_ok < 1 || argv_test_ok < 1 || stacktest_ok < 1) {
+           subdir_test_ok < 1 || argv_test_ok < 1 || stacktest_ok < 1 || network_test_ok < 1) {
         spins++;
         if (spins > 4000000000ULL) {
             panic("scheduler/syscall/isolation self-test: no progress "
-                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d)",
+                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d net=%d)",
                   worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok,
-                  exec_wait_ok, subdir_test_ok, argv_test_ok, stacktest_ok);
+                  exec_wait_ok, subdir_test_ok, argv_test_ok, stacktest_ok, network_test_ok);
         }
     }
     kprintf("TEST MODE: scheduler+syscall+isolation self-test passed "
@@ -267,7 +289,7 @@ void kmain(boot_info_t *info) {
 
     fb_init(&info->framebuffer);
     fb_clear(0x00102030);
-    fb_puts(8, 8, "REBORNOS -- MILESTONE 9: REAL VIRTUAL MEMORY", 0xFFFFFFFF, 0x00102030);
+    fb_puts(8, 8, "REBORNOS -- MILESTONE 10: NETWORKING", 0xFFFFFFFF, 0x00102030);
     fb_puts(8, 24, "SERIAL + FRAMEBUFFER ALIVE.", 0xFFA0A0A0, 0x00102030);
 
     kprintf("kmain: boot checks complete\n");
@@ -285,6 +307,8 @@ void kmain(boot_info_t *info) {
     keyboard_init();
     heap_init();
     vfs_init();
+    e1000_init();
+    net_init();
 
 #ifdef REBORNOS_TEST_MODE
     /* Exercise the physical allocator: distinct pages, independently
@@ -425,6 +449,7 @@ void kmain(boot_info_t *info) {
     thread_create("subdir-test", subdir_test_thread);
     thread_create("argv-test", argv_test_thread);
     thread_create("stack-test", stacktest_thread);
+    thread_create("network-test", network_test_thread);
     boot_shell();
     timer_set_tick_callback(schedule);
     scheduler_start();

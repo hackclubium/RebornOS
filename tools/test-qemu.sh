@@ -26,6 +26,7 @@ timeout 40 qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS_test.fd" \
     -drive file=fat:16:rw:"$BUILD/esp-test",format=raw \
+    -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
     -display none \
     -serial stdio \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \

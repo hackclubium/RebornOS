@@ -17,6 +17,7 @@ exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
     -drive file=fat:rw:"$BUILD/esp",format=raw \
+    -netdev user,id=net0 -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
     -serial stdio \
     -no-reboot \
     -s -S
