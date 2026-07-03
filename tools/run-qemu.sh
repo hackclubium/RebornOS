@@ -21,4 +21,5 @@ exec qemu-system-x86_64 \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
     -drive file=fat:16:rw:"$BUILD/esp",format=raw \
     -serial stdio \
+    -monitor telnet:127.0.0.1:4444,server,nowait \
     -no-reboot

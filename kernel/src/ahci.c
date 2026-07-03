@@ -4,6 +4,7 @@
 #include "pmm.h"
 #include "panic.h"
 #include "minilib.h"
+#include "interrupts.h"
 
 /* A minimal polled (no interrupts) AHCI driver: enough to find the
  * boot disk and issue READ/WRITE DMA EXT commands on a single command
@@ -210,11 +211,27 @@ void blockdev_init(void) {
 
 /* Shared by both directions: reads and writes only differ in the ATA
  * command byte and the command header's Write bit -- the PRDT either
- * side uses just names a physical buffer the HBA DMAs into or out of. */
+ * side uses just names a physical buffer the HBA DMAs into or out of.
+ *
+ * cmd_list/cmd_table/the HBA's single command slot are shared global
+ * state with no per-thread copies, and the scheduler is preemptive
+ * (timer_set_tick_callback(schedule) in kmain.c fires every tick, not
+ * just at explicit yield points) -- so without protection, a timer IRQ
+ * landing mid-transfer can switch to another thread that starts its
+ * own disk operation, overwriting this one's still-in-flight command
+ * setup. The HBA reports that stray command's completion, this
+ * function's poll loop sees PORT_CI clear and returns believing its
+ * own request finished, and the caller silently gets someone else's
+ * data with no error ever raised. irq_save_disable()/irq_restore()
+ * make the whole setup-issue-poll-check sequence atomic with respect
+ * to preemption, and nest correctly if ever called from within
+ * another already-cli'd critical section. */
 static void issue_rw_command(uint64_t lba, uint32_t count, void *buf, int is_write) {
     if (count == 0) {
         return;
     }
+
+    uint64_t irq_flags = irq_save_disable();
 
     fis_reg_h2d_t *fis = (fis_reg_h2d_t *)cmd_table->cfis;
     memset(fis, 0, sizeof(*fis));
@@ -254,6 +271,8 @@ static void issue_rw_command(uint64_t lba, uint32_t count, void *buf, int is_wri
         panic("ahci: device reported an error (lba=%lu count=%u write=%d, tfd=0x%lx)",
               lba, count, is_write, (uint64_t)tfd);
     }
+
+    irq_restore(irq_flags);
 }
 
 void blockdev_read_sectors(uint64_t lba, uint32_t count, void *buf) {

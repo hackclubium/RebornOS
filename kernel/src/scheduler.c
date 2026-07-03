@@ -5,6 +5,7 @@
 #include "panic.h"
 #include "vmm.h"
 #include "gdt.h"
+#include "interrupts.h"
 
 typedef enum {
     THREAD_UNUSED = 0, /* free slot -- available to thread_create_ex() */
@@ -39,7 +40,19 @@ void scheduler_init(void) {
     current_thread = -1;
 }
 
+/* threads[]/active_count are global mutable state read and written by
+ * every caller of thread_create_ex() (SYS_EXEC, process spawning, the
+ * self-test threads at boot, ...) -- with the preemptive scheduler, a
+ * timer tick between the free-slot scan and claiming it could let two
+ * concurrent calls pick the same slot, or land active_count++ between
+ * another thread's read and write of it and lose an increment (which
+ * is exactly the kind of corruption that makes schedule() think the
+ * wrong thread is the last one alive). irq_save_disable()/irq_restore()
+ * make the whole reserve-and-initialize sequence atomic; kmalloc()
+ * below already nests safely with this. */
 static int thread_create_ex(const char *name, void (*entry)(void), void *arg, uint64_t cr3) {
+    uint64_t flags = irq_save_disable();
+
     int id = -1;
     for (unsigned int i = 0; i < SCHEDULER_MAX_THREADS; i++) {
         if (threads[i].state == THREAD_UNUSED) {
@@ -48,11 +61,13 @@ static int thread_create_ex(const char *name, void (*entry)(void), void *arg, ui
         }
     }
     if (id < 0) {
+        irq_restore(flags);
         panic("thread_create: too many threads (max %u)", SCHEDULER_MAX_THREADS);
     }
 
     uint8_t *stack = (uint8_t *)kmalloc(SCHEDULER_STACK_SIZE);
     if (stack == NULL) {
+        irq_restore(flags);
         panic("thread_create: kmalloc failed for a %u-byte stack", SCHEDULER_STACK_SIZE);
     }
 
@@ -90,6 +105,7 @@ static int thread_create_ex(const char *name, void (*entry)(void), void *arg, ui
     }
     threads[id].name[i] = '\0';
 
+    irq_restore(flags);
     return id;
 }
 

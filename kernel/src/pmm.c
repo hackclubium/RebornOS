@@ -4,6 +4,7 @@
 #include "kprintf.h"
 #include "panic.h"
 #include "minilib.h"
+#include "interrupts.h"
 
 static uint8_t *bitmap;
 static uint64_t bitmap_bits;   /* one bit per page; bit N == physical address N * PMM_PAGE_SIZE */
@@ -115,20 +116,31 @@ void pmm_init(const boot_info_t *info) {
             (uint64_t)(uintptr_t)bitmap, bitmap_bytes);
 }
 
+/* bitmap/free_pages/search_hint are global mutable state with no
+ * per-thread copies, called from all over the preemptible kernel
+ * (page table setup, AHCI init, process address spaces, ...) -- same
+ * hazard as kmalloc/kfree in heap.c, same fix: irq_save_disable()/
+ * irq_restore() make each call atomic with respect to a timer tick
+ * switching threads mid-update, and nest correctly if called from
+ * within another already-cli'd critical section. */
 void *pmm_alloc_page(void) {
+    uint64_t flags = irq_save_disable();
     for (uint64_t i = 0; i < bitmap_bits; i++) {
         uint64_t bit = (search_hint + i) % bitmap_bits;
         if (!bitmap_test(bit)) {
             bitmap_set(bit);
             free_pages--;
             search_hint = bit + 1;
+            irq_restore(flags);
             return (void *)(uintptr_t)(bit * PMM_PAGE_SIZE);
         }
     }
+    irq_restore(flags);
     return NULL;
 }
 
 void pmm_free_page(void *phys_addr) {
+    uint64_t flags = irq_save_disable();
     uint64_t bit = (uint64_t)(uintptr_t)phys_addr / PMM_PAGE_SIZE;
     if (bit >= bitmap_bits) {
         panic("pmm_free_page: address 0x%lx is outside the tracked range", (uint64_t)(uintptr_t)phys_addr);
@@ -138,6 +150,7 @@ void pmm_free_page(void *phys_addr) {
     }
     bitmap_clear(bit);
     free_pages++;
+    irq_restore(flags);
 }
 
 void pmm_reserve_region(uint64_t phys_addr, uint64_t size) {

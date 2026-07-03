@@ -185,6 +185,32 @@ void _start(void) {
             continue;
         }
 
+        /* Every program is staged on disk as an uppercase NAME.ELF (see
+         * tools/mkimage.sh) and fat16.c matches names exactly -- typing
+         * the bare command name like a normal shell (`echo`, not
+         * `echo.elf`) would otherwise always miss. Append .elf when the
+         * user didn't already type an extension. */
+        char exec_name[LINE_MAX + 4];
+        int has_dot = 0;
+        for (const char *s = argv[0]; *s != '\0'; s++) {
+            if (*s == '.') {
+                has_dot = 1;
+                break;
+            }
+        }
+        if (!has_dot) {
+            unsigned int i = 0;
+            for (; argv[0][i] != '\0' && i < sizeof(exec_name) - 5; i++) {
+                exec_name[i] = argv[0][i];
+            }
+            const char *suffix = ".elf";
+            for (int j = 0; suffix[j] != '\0'; j++) {
+                exec_name[i++] = suffix[j];
+            }
+            exec_name[i] = '\0';
+            argv[0] = exec_name;
+        }
+
         if (sys_exec(argv, argc) != 0) {
             sys_write("shell: command not found\n");
         }

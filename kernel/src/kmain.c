@@ -245,8 +245,13 @@ void kmain(boot_info_t *info) {
     pmm_init(info);
     vmm_init();
     idt_init();
-    keyboard_init();
+    /* timer_init() owns the one-time PIC remap (see timer.c's
+     * pic_remap()), which masks every IRQ line as part of remapping --
+     * it must run before any driver unmasks its own line, or the remap
+     * silently clobbers that unmask. keyboard_init() unmasks IRQ1, so
+     * it has to come after. */
     timer_init(100);
+    keyboard_init();
     heap_init();
     vfs_init();
 
