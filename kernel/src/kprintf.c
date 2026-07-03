@@ -1,6 +1,14 @@
 #include <stdint.h>
 #include "kprintf.h"
 #include "serial.h"
+#include "spinlock.h"
+
+/* The UART is shared hardware state -- once more than one core can
+ * genuinely be running at once (see smp.c), two cores calling
+ * kprintf() concurrently interleave their bytes on the wire with no
+ * lock protecting it. This is the first thing SMP actually needed a
+ * real cross-core lock for. */
+static spinlock_t serial_lock = SPINLOCK_INIT;
 
 static void print_unsigned(uint64_t v, int base, int uppercase) {
     char buf[32];
@@ -30,6 +38,7 @@ static void print_signed(int64_t v) {
 }
 
 void kvprintf(const char *fmt, va_list args) {
+    spinlock_acquire(&serial_lock);
     for (const char *p = fmt; *p; p++) {
         if (*p != '%') {
             serial_write_char(*p);
@@ -89,6 +98,7 @@ void kvprintf(const char *fmt, va_list args) {
                 break;
         }
     }
+    spinlock_release(&serial_lock);
 }
 
 void kprintf(const char *fmt, ...) {

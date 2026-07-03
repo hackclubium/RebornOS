@@ -33,6 +33,14 @@ typedef struct {
     uint64_t memory_map_size;
     uint64_t memory_map_descriptor_size;
     uint32_t memory_map_descriptor_version;
+
+    /* Physical address of the ACPI RSDP, found by the bootloader in
+     * UEFI's own Configuration Table (the reliable way to find it --
+     * OVMF doesn't necessarily also mirror ACPI tables into the legacy
+     * BIOS memory areas a non-UEFI OS would scan). 0 if the firmware's
+     * configuration table didn't have one, in which case smp.c simply
+     * runs single-core. */
+    uint64_t acpi_rsdp_addr;
 } boot_info_t;
 
 #endif /* REBORNOS_BOOT_INFO_H */

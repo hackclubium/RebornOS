@@ -530,7 +530,7 @@ Not yet: demand-paged heap growth for user programs (none of today's
 programs need one), copy-on-write, swapping, or any notion of memory
 outside a process's fixed load region and its one growable stack.
 
-## Milestone 10: Networking (current)
+## Milestone 10: Networking
 
 Goal: RebornOS talks to the outside world. A polled Intel 82540EM
 ("e1000") driver -- QEMU's default emulated NIC -- plus just enough of
@@ -582,6 +582,79 @@ that's the natural next step once there's a reason to need a transport
 protocol), IPv6, and anything beyond a single hardcoded IP on a single
 NIC.
 
+## Milestone 11: SMP (current)
+
+Goal: use every CPU core QEMU gives us, not just the one UEFI hands
+off on. Discovers every core via ACPI, boots each one into 64-bit long
+mode through the classic INIT-SIPI-SIPI sequence and a real-mode
+trampoline, and proves they're genuinely running in parallel with the
+BSP -- distributing actual scheduled threads across them is future
+work; this milestone is about getting other cores alive and executing
+kernel code safely at all.
+
+- **`kernel/src/acpi.c`**: parses just enough ACPI to find the MADT
+  (Multiple APIC Description Table) and enumerate every enabled Local
+  APIC entry -- no AML interpreter, no other tables. The RSDP address
+  comes from `boot_info_t` (`boot/src/main.c` now searches UEFI's own
+  Configuration Table for the ACPI 2.0/1.0 GUID) rather than scanning
+  legacy BIOS memory regions -- the first thing tried was scanning the
+  EBDA and BIOS ROM area the way a non-UEFI OS would, which found
+  nothing under OVMF, before switching to the reliable UEFI-native
+  path.
+- **`kernel/src/lapic.c`**: Local APIC access (MMIO base from
+  `IA32_APIC_BASE`, enabling it, sending INIT/SIPI interprocessor
+  interrupts) -- used only to wake other cores; every actual hardware
+  IRQ (timer, keyboard) still routes through the legacy 8259 PIC
+  exactly as before.
+- **`kernel/src/ap_trampoline.S`**: a from-scratch real-mode bootstrap
+  -- the first 16-bit code this kernel has ever needed. Placed at a
+  fixed physical address (`kernel/linker.ld` gives it its own PT_LOAD
+  segment at `0x8000`, so the bootloader's existing generic
+  per-segment loader places the bytes there automatically, no new
+  build step). Walks 16-bit real mode -> 32-bit protected mode -> 64-bit
+  long mode using a tiny temporary GDT, loads a real per-AP stack, and
+  calls into `ap_entry()` (`smp.c`), which switches to the kernel's
+  real GDT/IDT before doing anything else. Every address needed while
+  still in 16-bit mode is computed as a compile-time constant
+  (`TRAMPOLINE_BASE + label - ap_trampoline_start`) rather than a bare
+  linker-resolved absolute reference -- 16-bit absolute relocations
+  turned out to be an unreliable corner of an elf64-x86-64 toolchain.
+- **`kernel/src/spinlock.c`**: the first real cross-core lock in this
+  kernel (test-and-test-and-set via `xchg`). Every "critical section"
+  before this milestone was a bare `cli`/`sti` pair, correct on one
+  core (disabling interrupts stops the only other thing that could
+  run: a preempting timer tick on that same core) but meaningless
+  across cores, since `cli` on one core does nothing to stop another
+  core running the same code at the same time. Wired in first for
+  `kprintf`'s shared UART -- two cores printing concurrently otherwise
+  interleave their bytes on the wire.
+- **The actual bug, once everything above worked**: every AP
+  triple-faulted the instant it touched its own (heap-allocated) stack,
+  even though the exact same memory was already in daily use by the
+  BSP. EFER is a *per-core* register -- `vmm_init()` sets EFER.NXE on
+  the BSP only, and the identity map marks everything above
+  `KERNEL_EXEC_LIMIT` (all of the heap included) NX. An AP starting
+  fresh via SIPI has its own EFER with NXE=0, which turns that same NX
+  bit into a *reserved-bit* violation from its point of view -- and
+  since `ap_entry()` hadn't loaded a real IDT yet at the point of first
+  stack use, that fault had nowhere survivable to go and took down the
+  whole VM. Found by bisecting the trampoline instruction by instruction
+  with raw port-I/O breadcrumbs (bypassing `kprintf` entirely) until the
+  exact faulting operation was isolated, then fixed by setting EFER.NXE
+  on the AP alongside EFER.LME.
+- **A new self-test** (`smp_test_thread` in `kmain.c`) waits until
+  every core smp.c started has incremented its own private counter
+  past a threshold -- proof cores are actually executing in parallel,
+  not just that `smp_init()` believed it started them. QEMU scripts
+  gained `-smp 4`.
+
+Not yet: distributing real scheduled threads/processes across cores
+(every AP just spins incrementing its own counter forever), per-core
+interrupt handling (only the BSP takes IRQs/exceptions/syscalls),
+real spinlock coverage for the heap/page allocator/AHCI/e1000 (none of
+those are touched concurrently yet, since APs don't run real work),
+and CPU hotplug.
+
 ## Building
 
 Everything here runs inside WSL2 (or native Linux) -- the toolchains
@@ -632,9 +705,12 @@ AHCI disk driver -> subdirectories, real argv, and disk write support
 -> real virtual memory: a genuinely ring-0-only kernel mapping, real
 per-process pointer validation, and page-fault-driven stack growth ->
 networking: a polled e1000 driver plus Ethernet/ARP/ICMP, proven with a
-real ping round-trip through QEMU's NAT (done). Next: UDP/TCP and a
-minimal HTTP responder are the leading candidates for the next big
-push; piping (needs a real file-descriptor abstraction first), command
+real ping round-trip through QEMU's NAT -> SMP: every core discovered
+via ACPI, booted through a real-mode trampoline into long mode, proven
+running in parallel (done). Next: distributing real scheduled threads
+across cores (today every AP just spins alone) is the leading
+candidate for the next big push; UDP/TCP and a minimal HTTP responder,
+piping (needs a real file-descriptor abstraction first), command
 history, and shell quoting remain smaller open items. GUI, package
 managers, and Linux binary compatibility are deliberately out of scope
 until there's a command-line system that boots reliably, manages

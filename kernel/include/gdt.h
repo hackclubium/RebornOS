@@ -17,6 +17,19 @@
  * idt_init(), which reads the *current* CS to populate IDT gates. */
 void gdt_init(void);
 
+/* Every core has its own GDTR register even though the GDT itself is
+ * one shared table in memory -- gdt_init() only loads the BSP's GDTR.
+ * An AP loads its own temporary GDT to get into long mode in the
+ * first place (see ap_trampoline.S), then calls this once it's
+ * running real C code to switch to the kernel's real, permanent GDT
+ * before doing anything else (it must not keep pointing at the
+ * trampoline's temporary one, which lives in low memory that could
+ * later be reused for something else). No TSS/LTR here -- an AP never
+ * takes a ring3->ring0 transition in this milestone (it only ever
+ * runs its own kernel-mode counting loop), so it has no need for
+ * one. */
+void gdt_load_on_this_cpu(void);
+
 /* TSS.RSP0 is *the* kernel stack the CPU switches to on any ring3->
  * ring0 transition -- there's only one such register, so with more
  * than one ring-3-capable thread it must be updated to the currently

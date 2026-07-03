@@ -20,6 +20,7 @@
 #include "minilib.h"
 #include "e1000.h"
 #include "net.h"
+#include "smp.h"
 
 /* Tiny int $0x80 wrappers for the ring-3 demo program below. "+a"(ret)
  * both supplies the syscall number (via ret's initial value) and reads
@@ -239,6 +240,44 @@ static void network_test_thread(void) {
     thread_exit();
 }
 
+/* Proves other CPU cores are genuinely executing in parallel with the
+ * BSP, not just that smp_init() thought it started them: every core
+ * smp.c brought up increments only its own private slot in
+ * smp_ap_counters[] forever, so this only passes if at least
+ * (smp_cpu_count() - 1) distinct slots are actually moving. The BSP's
+ * own slot is never written by anyone (see ap_entry() in smp.c), so it
+ * naturally never counts towards "progressed" without needing to know
+ * which array index belongs to which core. */
+static volatile int smp_test_ok = 0;
+
+static void smp_test_thread(void) {
+    uint32_t total_cores = smp_cpu_count();
+    if (total_cores <= 1) {
+        panic("smp self-test: no additional CPU cores came up (ACPI/APIC startup failed)");
+    }
+
+    uint64_t spins = 0;
+    for (;;) {
+        uint32_t progressed = 0;
+        for (uint32_t i = 0; i < SMP_MAX_CPUS; i++) {
+            if (smp_ap_counters[i] > 1000) {
+                progressed++;
+            }
+        }
+        if (progressed >= total_cores - 1) {
+            break;
+        }
+        spins++;
+        if (spins > 4000000000ULL) {
+            panic("smp self-test: not every started core made progress (cores=%u progressed=%u)",
+                  total_cores, progressed);
+        }
+        schedule();
+    }
+    smp_test_ok = 1;
+    thread_exit();
+}
+
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
     /* syscall_write_count >= 6: ring3_program's 5 fixed writes plus
@@ -250,13 +289,14 @@ static void scheduler_monitor(void) {
      * two are). */
     while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 6 ||
            process_a_ok < 200 || process_b_ok < 200 || exec_wait_ok < 1 ||
-           subdir_test_ok < 1 || argv_test_ok < 1 || stacktest_ok < 1 || network_test_ok < 1) {
+           subdir_test_ok < 1 || argv_test_ok < 1 || stacktest_ok < 1 || network_test_ok < 1 ||
+           smp_test_ok < 1) {
         spins++;
         if (spins > 4000000000ULL) {
             panic("scheduler/syscall/isolation self-test: no progress "
-                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d net=%d)",
+                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d net=%d smp=%d)",
                   worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok,
-                  exec_wait_ok, subdir_test_ok, argv_test_ok, stacktest_ok, network_test_ok);
+                  exec_wait_ok, subdir_test_ok, argv_test_ok, stacktest_ok, network_test_ok, smp_test_ok);
         }
     }
     kprintf("TEST MODE: scheduler+syscall+isolation self-test passed "
@@ -289,7 +329,7 @@ void kmain(boot_info_t *info) {
 
     fb_init(&info->framebuffer);
     fb_clear(0x00102030);
-    fb_puts(8, 8, "REBORNOS -- MILESTONE 10: NETWORKING", 0xFFFFFFFF, 0x00102030);
+    fb_puts(8, 8, "REBORNOS -- MILESTONE 11: SMP", 0xFFFFFFFF, 0x00102030);
     fb_puts(8, 24, "SERIAL + FRAMEBUFFER ALIVE.", 0xFFA0A0A0, 0x00102030);
 
     kprintf("kmain: boot checks complete\n");
@@ -309,6 +349,7 @@ void kmain(boot_info_t *info) {
     vfs_init();
     e1000_init();
     net_init();
+    smp_init(info->acpi_rsdp_addr);
 
 #ifdef REBORNOS_TEST_MODE
     /* Exercise the physical allocator: distinct pages, independently
@@ -450,6 +491,7 @@ void kmain(boot_info_t *info) {
     thread_create("argv-test", argv_test_thread);
     thread_create("stack-test", stacktest_thread);
     thread_create("network-test", network_test_thread);
+    thread_create("smp-test", smp_test_thread);
     boot_shell();
     timer_set_tick_callback(schedule);
     scheduler_start();

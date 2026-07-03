@@ -50,6 +50,13 @@ static inline void irq_restore(uint64_t flags) {
 
 void idt_init(void);
 
+/* Every core has its own IDTR register even though the IDT itself is
+ * one shared table in memory -- idt_init() only loads the BSP's IDTR.
+ * An AP that comes up later must call this once (after idt_init() has
+ * already built the shared table) so a fault on that core doesn't
+ * immediately triple-fault from having a garbage/zero IDTR. */
+void idt_load_on_this_cpu(void);
+
 /* Lets device drivers (timer.c, keyboard.c, ...) claim their own IRQ
  * line without idt.c needing to know anything about the PIC or any
  * particular device -- `irq` is the PIC-relative line number (0 for

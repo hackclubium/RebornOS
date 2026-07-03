@@ -11,6 +11,40 @@ static const EFI_GUID gEfiSimpleFileSystemProtocolGuid = EFI_SIMPLE_FILE_SYSTEM_
 static const EFI_GUID gEfiFileInfoGuid = EFI_FILE_INFO_ID;
 static const EFI_GUID gEfiGraphicsOutputProtocolGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
 
+/* {8868e871-e4f1-11d3-bc22-0080c73c8881} / {eb9d2d30-2d88-11d3-9a16-0090273fc14d} --
+ * the well-known GUIDs UEFI's Configuration Table uses to tag its ACPI
+ * 2.0+ and (as a fallback) ACPI 1.0 RSDP entries. */
+static const EFI_GUID gEfiAcpi20TableGuid = {
+    0x8868e871, 0xe4f1, 0x11d3, { 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81 }
+};
+static const EFI_GUID gEfiAcpi10TableGuid = {
+    0xeb9d2d30, 0x2d88, 0x11d3, { 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d }
+};
+
+static int guid_equal(const EFI_GUID *a, const EFI_GUID *b) {
+    return a->Data1 == b->Data1 && a->Data2 == b->Data2 && a->Data3 == b->Data3 &&
+           memcmp(a->Data4, b->Data4, sizeof(a->Data4)) == 0;
+}
+
+/* Searches the firmware's own Configuration Table for the ACPI RSDP --
+ * the reliable way to find it on a UEFI system (unlike a non-UEFI OS,
+ * we don't need to fall back to scanning legacy BIOS memory areas).
+ * Prefers the ACPI 2.0+ entry, falls back to ACPI 1.0, returns 0 if
+ * neither is present. */
+static uint64_t find_acpi_rsdp(const EFI_SYSTEM_TABLE *system_table) {
+    VOID *acpi1_table = NULL;
+    for (UINTN i = 0; i < system_table->NumberOfTableEntries; i++) {
+        const EFI_CONFIGURATION_TABLE *entry = &system_table->ConfigurationTable[i];
+        if (guid_equal(&entry->VendorGuid, &gEfiAcpi20TableGuid)) {
+            return (uint64_t)(UINTN)entry->VendorTable;
+        }
+        if (guid_equal(&entry->VendorGuid, &gEfiAcpi10TableGuid)) {
+            acpi1_table = entry->VendorTable;
+        }
+    }
+    return (uint64_t)(UINTN)acpi1_table;
+}
+
 static void log(const char *s) {
     serial_write(s);
 }
@@ -175,6 +209,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     log_hex(info->framebuffer.height);
     log(" @ ");
     log_hex(info->framebuffer.base);
+    log("\n");
+
+    info->acpi_rsdp_addr = find_acpi_rsdp(SystemTable);
+    log("acpi rsdp: ");
+    log_hex(info->acpi_rsdp_addr);
     log("\n");
 
     /* 5. Get the memory map and exit boot services. Per spec, any pool

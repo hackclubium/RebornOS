@@ -122,3 +122,12 @@ void gdt_init(void) {
 void tss_set_kernel_stack(uint64_t rsp0) {
     tss.rsp0 = rsp0;
 }
+
+void gdt_load_on_this_cpu(void) {
+    gdt_ptr_t ptr = {
+        .limit = sizeof(gdt_table) - 1,
+        .base = (uint64_t)(uintptr_t)&gdt_table,
+    };
+    load_gdt(&ptr);
+    reload_segments();
+}

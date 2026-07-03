@@ -22,7 +22,7 @@ rm -f "$BUILD/test-serial.log"
 # back to software emulation (TCG), which is noticeably slower through
 # OVMF's PEI/DXE/BDS phases than a KVM-accelerated local run.
 timeout 40 qemu-system-x86_64 \
-    -machine q35 -m 256M \
+    -machine q35 -m 256M -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS_test.fd" \
     -drive file=fat:16:rw:"$BUILD/esp-test",format=raw \

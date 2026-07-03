@@ -120,6 +120,10 @@ void idt_init(void) {
     }
     idt_set_entry(SYSCALL_VECTOR, (uint64_t)(uintptr_t)isr_stub_128, cs, IDT_TYPE_INTERRUPT_GATE_DPL3);
 
+    idt_load_on_this_cpu();
+}
+
+void idt_load_on_this_cpu(void) {
     idt_ptr_t idt_ptr = {
         .limit = sizeof(idt) - 1,
         .base = (uint64_t)(uintptr_t)&idt,

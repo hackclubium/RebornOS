@@ -13,7 +13,7 @@ echo "  gdb $BUILD/kernel.elf -ex 'target remote :1234'"
 echo
 
 exec qemu-system-x86_64 \
-    -machine q35 -m 256M \
+    -machine q35 -m 256M -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS.fd" \
     -drive file=fat:rw:"$BUILD/esp",format=raw \
