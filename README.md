@@ -394,7 +394,7 @@ AHCI controller beyond QEMU's emulated ICH9. Real hardware
 compatibility (spin-up delays, BIOS/OS handoff) is unexplored. Write
 support landed the very next milestone.
 
-## Milestone 8: Subdirectories, Arguments, and Write Support (current)
+## Milestone 8: Subdirectories, Arguments, and Write Support
 
 Goal: three separate upgrades that all make the shell feel like a real
 one instead of a demo -- programs can live in folders, take arguments,
@@ -462,6 +462,74 @@ here would have been worse than giving it its own milestone. Also not
 yet: quoting in the shell's tokenizer, command history, writing into
 subdirectories, and growing a directory's cluster chain when it's full.
 
+## Milestone 9: Real Virtual Memory (current)
+
+Goal: close the gap between "process isolation" as a demo and process
+isolation as something actually enforced. Every process has had its own
+page tables since Milestone 4, but the low 4 GiB every address space
+shares (kernel code, the heap, the framebuffer, the page tables
+themselves) was mapped `PAGE_USER` end to end -- a ring-3 program could
+dereference any address below 4 GiB and the CPU would allow it. This
+milestone makes that mapping genuinely ring-0-only, replaces the
+syscall layer's coarse pointer-range heuristic with real per-process
+page-table validation, and adds page-fault-driven stack growth so the
+user stack isn't a fixed, non-growable allocation anymore.
+
+- **The shared low-4GiB mapping is no longer user-accessible**
+  (`kernel/src/vmm.c`): only the executable first 4 MiB keeps
+  `PAGE_USER` (see the next bullet for why), everything else -- the
+  heap, the physical page bitmap, the page tables themselves, the
+  framebuffer -- is supervisor-only. Ring 0 can still reach all of it
+  regardless (the User bit only gates ring-3 accesses), but a ring-3
+  program's own page tables share this exact mapping verbatim, so this
+  is what actually makes kernel memory off-limits to user code rather
+  than just conventionally left alone.
+- **A real compatibility snag from tightening that**: `kmain.c` has had
+  a pair of hand-rolled ring-3 test programs (`ring3_program`,
+  `process_body`) since before the ELF loader existed, launched
+  directly out of the kernel's own low-memory text section -- which is
+  exactly why the executable first 4 MiB above keeps `PAGE_USER`. Their
+  *stacks*, though, were plain `kmalloc()` buffers from the now
+  correctly non-user kernel heap, so the very first thing they did
+  (push a return address) turned into an instant ring-3 page fault.
+  Fixed by giving them a real per-process stack instead -- allocated
+  via `pmm_alloc_page()` and mapped into the calling thread's own
+  address space (`vmm_current_cr3()`, always available since a syscall
+  or a fresh thread's first instructions never switch CR3 out from
+  under it) the same way `elf_loader.c` already builds a stack for a
+  real loaded program.
+- **Real per-process pointer validation** (`vmm_check_range()`,
+  `vmm.c`): walks the caller's actual page tables to confirm a
+  syscall's user-supplied buffer is really present, user-accessible,
+  and (when the kernel intends to write into it) writable, instead of
+  the old `user_ptr_valid()`'s "is this address in one of a few known
+  ranges" heuristic. Works for any buffer a process legitimately has
+  mapped, not just hardcoded regions. `copy_user_string()` now
+  re-validates one page at a time as it copies a NUL-terminated string
+  out of user memory, rather than requiring the whole worst-case length
+  to be valid up front -- which also fully retires the awkward
+  "only the start address needs to be in range" workaround Milestone 8
+  needed for the exact same check.
+- **Page-fault-driven stack growth** (`elf_handle_stack_fault()`,
+  `elf_loader.c`): the ELF loader now only maps a user program's
+  topmost stack page eagerly; a not-present write fault from ring 3
+  anywhere else within a bounded growth region (`ELF_USER_STACK_MAX_PAGES`,
+  256 KiB) demand-maps a fresh zeroed page and retries the faulting
+  instruction, instead of the old fixed 16 KiB allocation that could
+  never grow. A fault outside that range, from ring 0, or on an
+  already-present page still falls through to `idt.c`'s normal panic
+  path -- this only ever papers over the one specific, legitimate case.
+  `userland/stacktst.c` is a new test program that recurses far past
+  the first page specifically to prove this is really happening rather
+  than just never being exercised.
+- Test mode gained a deterministic self-test (`stack-test`) spawning
+  `STACKTST.ELF` and asserting it exits cleanly, plus every existing
+  self-test now runs under the tightened permissions unchanged.
+
+Not yet: demand-paged heap growth for user programs (none of today's
+programs need one), copy-on-write, swapping, or any notion of memory
+outside a process's fixed load region and its one growable stack.
+
 ## Building
 
 Everything here runs inside WSL2 (or native Linux) -- the toolchains
@@ -509,9 +577,12 @@ per-process address space isolation -> VFS + a FAT16 filesystem + an
 ELF loader for real disk-loaded programs -> a keyboard driver, real
 thread exit, and an interactive shell -> PCI enumeration and a real
 AHCI disk driver -> subdirectories, real argv, and disk write support
-(done). Next: piping (needs a real file-descriptor abstraction first),
-command history, and shell quoting. GUI, networking, package managers,
-and Linux binary compatibility are deliberately out of scope until
-there's a command-line system that
-boots reliably, manages memory correctly, runs isolated programs, and
-touches files.
+-> real virtual memory: a genuinely ring-0-only kernel mapping, real
+per-process pointer validation, and page-fault-driven stack growth
+(done). Next: networking (a driver plus a minimal TCP/IP stack) is the
+leading candidate for the next big milestone; piping (needs a real
+file-descriptor abstraction first), command history, and shell quoting
+remain smaller open items. GUI, package managers, and Linux binary
+compatibility are deliberately out of scope until there's a
+command-line system that boots reliably, manages memory correctly,
+runs isolated programs, and touches files.

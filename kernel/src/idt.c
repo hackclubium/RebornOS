@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include "interrupts.h"
 #include "panic.h"
+#include "elf_loader.h"
 
 extern uint64_t isr_stub_table[IDT_VECTOR_COUNT];
 extern void isr_stub_128(void); /* int $0x80 -- registered directly, not part of isr_stub_table */
@@ -68,8 +69,13 @@ static const char *exception_name(uint64_t vector) {
 
 static void exception_handler(interrupt_frame_t *frame) {
     if (frame->vector == 14) {
+        uint64_t fault_addr = read_cr2();
+        int from_ring3 = (frame->cs & 0x3) == 3;
+        if (elf_handle_stack_fault(fault_addr, frame->error_code, from_ring3)) {
+            return; /* demand-paged in -- iretq retries the faulting instruction */
+        }
         panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx, fault address (cr2)=0x%lx",
-              frame->vector, exception_name(frame->vector), frame->rip, frame->error_code, read_cr2());
+              frame->vector, exception_name(frame->vector), frame->rip, frame->error_code, fault_addr);
     }
     panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx",
           frame->vector, exception_name(frame->vector), frame->rip, frame->error_code);

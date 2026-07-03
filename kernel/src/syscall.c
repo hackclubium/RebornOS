@@ -13,68 +13,48 @@
 
 volatile uint64_t syscall_write_count = 0;
 
-#define SYS_WRITE_MAX_LEN 256u /* SYS_WRITE takes a NUL-terminated string, not an (addr, len) pair,
-                                 * so there's no caller-supplied length to bounds-check against --
-                                 * this just bounds how far kprintf's %s is allowed to read before
-                                 * finding a NUL, so a bad pointer can't run off past the end of a
-                                 * genuinely valid page into who-knows-what. */
-
+#define SYS_WRITE_MAX_LEN 256u /* SYS_WRITE takes a NUL-terminated string, not an (addr, len)
+                                 * pair -- this just caps how much a single call can print. */
 #define SYS_PATH_MAX_LEN 64u
 #define SYS_EXEC_MAX_ARGS 16u
 #define SYS_EXEC_MAX_ARG_LEN 128u
 
-/* Necessary-but-not-sufficient validation: confirms the address range
- * falls inside memory this kernel actually manages (the shared
- * low-4GiB system mapping, or a process's private window), turning a
- * wild pointer into a clear panic instead of an unrelated page fault
- * three calls deep in kprintf. What it can NOT do yet is tell "this
- * process's private page" apart from "some other process's private
- * page" -- every process maps PROCESS_PRIVATE_VADDR to a *different*
- * physical page, but they all use the identical virtual address, so a
- * syscall has no way to know which one is "supposed" to be valid for
- * the caller without per-process access tracking, which doesn't exist
- * yet. Real user-pointer validation (copy_from_user-style) is a
- * further refinement once that tracking exists. */
-static int user_ptr_valid(const void *ptr, uint64_t len) {
-    uint64_t addr = (uint64_t)(uintptr_t)ptr;
-    if (addr == 0 || addr + len < addr) {
-        return 0;
-    }
-    if (addr + len <= 4ULL * 1024 * 1024 * 1024) {
-        return 1;
-    }
-    if (addr >= PROCESS_PRIVATE_VADDR && addr + len <= PROCESS_PRIVATE_VADDR + PMM_PAGE_SIZE) {
-        return 1;
-    }
-    /* Every program loaded via elf_load_user_program() lives somewhere
-     * between its fixed load base and the top of its (fixed) stack --
-     * see elf_loader.h. All loaded programs share these same two
-     * constants today (there's only ever one load address), so this is
-     * exactly as "necessary but not sufficient" as the check above.
-     *
-     * Only the *start* address needs to fit before the boundary, not
-     * start+len: a NUL-terminated string (SYS_WRITE) or a buffer the
-     * compiler placed within the process's own mapped stack can
-     * legitimately sit close enough to ELF_USER_STACK_TOP that a
-     * conservative worst-case length like SYS_WRITE_MAX_LEN would look
-     * like it spills past the boundary on paper without ever actually
-     * being read that far -- kprintf's %s stops at the real NUL, and a
-     * compiler-placed buffer can't itself exceed the stack it was
-     * allocated in. */
-    return addr >= ELF_USER_LOAD_BASE && addr < ELF_USER_STACK_TOP;
+/* Real per-process pointer validation: walks the caller's own page
+ * tables (vmm_check_range(), given the CR3 a syscall always runs
+ * under -- entering ring 0 via int $0x80 never switches address
+ * spaces) to confirm every page in [ptr, ptr+len) is actually mapped,
+ * user-accessible, and (if need_write) writable. Replaces the old
+ * coarse "is this address in one of a few known ranges" heuristic --
+ * this works for any buffer the process legitimately has mapped, not
+ * just a handful of hardcoded regions. */
+static int user_ptr_valid(const void *ptr, uint64_t len, int need_write) {
+    return vmm_check_range(vmm_current_cr3(), (uint64_t)(uintptr_t)ptr, len, need_write);
 }
 
 /* Validates and bounded-copies a NUL-terminated string out of user
- * memory. Panics (rather than silently truncating) on an invalid
- * pointer -- shared by every syscall below that takes a path. */
+ * memory, one page at a time -- re-checking with vmm_check_range()
+ * whenever the read crosses into a new page, rather than requiring the
+ * whole out_size worst case to be pre-validated up front (a short
+ * string legitimately placed right at the edge of mapped memory, e.g.
+ * near the top of the stack, would otherwise look like it "might" spill
+ * past the boundary on paper even though the real read never reaches
+ * that far). Panics on an invalid pointer -- shared by every syscall
+ * below that takes a path or string argument. */
 static void copy_user_string(uint64_t user_ptr, const char *syscall_name, char *out, uint32_t out_size) {
-    if (!user_ptr_valid((const void *)user_ptr, out_size)) {
-        panic("syscall_dispatch: %s got an invalid pointer 0x%lx", syscall_name, user_ptr);
-    }
-    const char *src = (const char *)user_ptr;
+    uint64_t pml4 = vmm_current_cr3();
+    uint64_t addr = user_ptr;
     uint32_t i = 0;
-    for (; i < out_size - 1 && src[i] != '\0'; i++) {
-        out[i] = src[i];
+    for (; i < out_size - 1; i++, addr++) {
+        if (addr % PMM_PAGE_SIZE == 0 || i == 0) {
+            if (!vmm_check_range(pml4, addr, 1, 0)) {
+                panic("syscall_dispatch: %s got an invalid pointer 0x%lx", syscall_name, user_ptr);
+            }
+        }
+        char c = *(const char *)(uintptr_t)addr;
+        if (c == '\0') {
+            break;
+        }
+        out[i] = c;
     }
     out[i] = '\0';
 }
@@ -89,14 +69,14 @@ void syscall_dispatch(interrupt_frame_t *frame) {
     }
 
     switch (frame->rax) {
-        case SYS_WRITE:
-            if (!user_ptr_valid((const void *)frame->rdi, SYS_WRITE_MAX_LEN)) {
-                panic("syscall_dispatch: SYS_WRITE got an invalid pointer 0x%lx", frame->rdi);
-            }
-            kprintf("%s", (const char *)frame->rdi);
+        case SYS_WRITE: {
+            char msg[SYS_WRITE_MAX_LEN];
+            copy_user_string(frame->rdi, "SYS_WRITE", msg, sizeof(msg));
+            kprintf("%s", msg);
             syscall_write_count++;
             frame->rax = 0;
             break;
+        }
 
         case SYS_EXIT:
             /* A nonzero code means the caller is self-reporting a
@@ -129,7 +109,7 @@ void syscall_dispatch(interrupt_frame_t *frame) {
             if (argc <= 0 || (uint64_t)argc > SYS_EXEC_MAX_ARGS) {
                 panic("syscall_dispatch: SYS_EXEC got a bad argc (%ld)", argc);
             }
-            if (!user_ptr_valid((const void *)frame->rdi, (uint64_t)argc * sizeof(char *))) {
+            if (!user_ptr_valid((const void *)frame->rdi, (uint64_t)argc * sizeof(char *), 0)) {
                 panic("syscall_dispatch: SYS_EXEC got an invalid argv array");
             }
             char **user_argv = (char **)(uintptr_t)frame->rdi;
@@ -162,7 +142,7 @@ void syscall_dispatch(interrupt_frame_t *frame) {
             } else {
                 copy_user_string(frame->rdi, "SYS_LIST_DIR", path, sizeof(path));
             }
-            if (!user_ptr_valid((const void *)frame->rsi, frame->rdx)) {
+            if (!user_ptr_valid((const void *)frame->rsi, frame->rdx, 1)) {
                 panic("syscall_dispatch: SYS_LIST_DIR got an invalid buffer 0x%lx (len %lu)",
                       frame->rsi, frame->rdx);
             }
@@ -173,7 +153,7 @@ void syscall_dispatch(interrupt_frame_t *frame) {
         case SYS_READ_FILE: {
             char path[SYS_PATH_MAX_LEN];
             copy_user_string(frame->rdi, "SYS_READ_FILE", path, sizeof(path));
-            if (!user_ptr_valid((const void *)frame->rsi, frame->rdx)) {
+            if (!user_ptr_valid((const void *)frame->rsi, frame->rdx, 1)) {
                 panic("syscall_dispatch: SYS_READ_FILE got an invalid buffer 0x%lx (len %lu)",
                       frame->rsi, frame->rdx);
             }
@@ -184,7 +164,7 @@ void syscall_dispatch(interrupt_frame_t *frame) {
         case SYS_WRITE_FILE: {
             char path[SYS_PATH_MAX_LEN];
             copy_user_string(frame->rdi, "SYS_WRITE_FILE", path, sizeof(path));
-            if (!user_ptr_valid((const void *)frame->rsi, frame->rdx)) {
+            if (!user_ptr_valid((const void *)frame->rsi, frame->rdx, 0)) {
                 panic("syscall_dispatch: SYS_WRITE_FILE got an invalid buffer 0x%lx (len %lu)",
                       frame->rsi, frame->rdx);
             }

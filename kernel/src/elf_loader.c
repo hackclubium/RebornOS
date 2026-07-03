@@ -155,6 +155,38 @@ void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t 
     out->argc = argc;
 }
 
+#define PF_ERROR_PRESENT (1u << 0) /* set if the fault was a protection violation on an
+                                     * already-present page; clear means "no page here at all",
+                                     * the only case demand-paging can legitimately service */
+
+int elf_handle_stack_fault(uint64_t fault_addr, uint64_t error_code, int from_ring3) {
+    if (!from_ring3) {
+        return 0; /* a kernel-mode fault is always a real bug -- never paper over those */
+    }
+    if (error_code & PF_ERROR_PRESENT) {
+        return 0; /* the page exists -- this is a permission violation, not a missing stack page */
+    }
+
+    uint64_t page_addr = page_align_down(fault_addr);
+    uint64_t stack_low = ELF_USER_STACK_TOP - (uint64_t)ELF_USER_STACK_MAX_PAGES * PMM_PAGE_SIZE;
+    if (page_addr < stack_low || page_addr >= ELF_USER_STACK_TOP) {
+        return 0; /* outside the stack's allowed growth range entirely */
+    }
+
+    uint64_t pml4_phys = vmm_current_cr3();
+    if (vmm_page_present(pml4_phys, page_addr)) {
+        return 0; /* already mapped -- whatever this fault is, it isn't a missing stack page */
+    }
+
+    void *phys = pmm_alloc_page();
+    if (phys == NULL) {
+        return 0; /* genuinely out of memory -- let the caller panic rather than loop forever */
+    }
+    memset(phys, 0, PMM_PAGE_SIZE);
+    vmm_map_page(pml4_phys, page_addr, (uint64_t)(uintptr_t)phys, VMM_MAP_WRITE);
+    return 1;
+}
+
 __attribute__((noreturn)) void elf_launch_process(void *arg) {
     elf_process_t *proc = (elf_process_t *)arg;
     uint64_t entry = proc->entry;

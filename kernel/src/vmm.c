@@ -40,6 +40,14 @@ static inline void load_cr3(uint64_t phys_addr) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(phys_addr) : "memory");
 }
 
+static inline uint64_t read_cr3(void) {
+    uint64_t v;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(v));
+    return v;
+}
+
+#define TABLE_ADDR_MASK (~0xFFFULL) /* strips flag bits, leaving just the 4KiB-aligned physical address */
+
 static pte_t *kernel_pml4;
 
 static pte_t *alloc_table(void) {
@@ -58,6 +66,12 @@ void vmm_init(void) {
 
     pte_t *pml4 = alloc_table();
     pte_t *pdpt = alloc_table();
+    /* PAGE_USER stays set at these two intermediate levels -- x86
+     * page-walk permissions are the AND of the User bit across every
+     * level, so if this level ever cleared it, the per-leaf distinction
+     * below could never take effect no matter what the leaf says.
+     * Whether ring 3 can actually reach any given page is decided
+     * entirely by that page's own leaf entry. */
     pml4[0] = (uint64_t)(uintptr_t)pdpt | PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
 
     for (int gib = 0; gib < IDENTITY_MAP_GIB; gib++) {
@@ -66,15 +80,25 @@ void vmm_init(void) {
 
         for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
             uint64_t phys = (uint64_t)gib * GIB + (uint64_t)i * HUGE_PAGE_SIZE;
-            /* PAGE_USER on the whole identity map: this low-4GiB range
-             * is the "system" mapping every address space shares
-             * verbatim via PML4[0] (see vmm_create_address_space) --
-             * kernel code, the heap, the framebuffer, all identical
-             * for every process. Per-process isolation lives entirely
-             * in PML4[1], a separate private mapping each address
-             * space gets its own copy of. */
-            pte_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_HUGE;
-            if (phys >= KERNEL_EXEC_LIMIT) {
+            /* Only the executable first KERNEL_EXEC_LIMIT bytes keep
+             * PAGE_USER: ring3_program/process_body (kmain.c) are
+             * ordinary kernel functions invoked directly via
+             * enter_usermode() as a lightweight ring3-transition test
+             * that predates the ELF loader, and their code lives in
+             * this same low kernel-image region, so it has to stay
+             * executable from ring 3. Every real user program instead
+             * gets its own private PML4[1] window (see
+             * vmm_create_address_space()) -- this narrow legacy slice
+             * is the only other place a leaf in this identity map ever
+             * carries PAGE_USER, so everything else here (the heap, the
+             * page tables themselves, the framebuffer, ...) stays
+             * genuinely off-limits to ring 3, which is what
+             * vmm_check_range() relies on when validating a syscall's
+             * user-supplied pointers. */
+            pte_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE;
+            if (phys < KERNEL_EXEC_LIMIT) {
+                flags |= PAGE_USER;
+            } else {
                 flags |= PAGE_NX;
             }
             pd[i] = phys | flags;
@@ -84,7 +108,7 @@ void vmm_init(void) {
     kernel_pml4 = pml4;
     load_cr3((uint64_t)(uintptr_t)pml4);
 
-    kprintf("vmm: own page tables live, identity-mapped 0-%uGiB (first %luMiB executable)\n",
+    kprintf("vmm: own page tables live, identity-mapped 0-%uGiB (first %luMiB executable, ring0-only)\n",
             IDENTITY_MAP_GIB, KERNEL_EXEC_LIMIT / (1024 * 1024));
 }
 
@@ -117,8 +141,6 @@ uint64_t vmm_create_address_space(void) {
 
     return (uint64_t)(uintptr_t)pml4;
 }
-
-#define TABLE_ADDR_MASK (~0xFFFULL) /* strips flag bits, leaving just the 4KiB-aligned physical address */
 
 void vmm_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr, uint32_t flags) {
     uint64_t pml4_idx = (vaddr >> 39) & 0x1FF;
@@ -154,4 +176,69 @@ void vmm_map_page(uint64_t pml4_phys, uint64_t vaddr, uint64_t paddr, uint32_t f
         leaf_flags |= PAGE_NX;
     }
     pt[pt_idx] = (paddr & TABLE_ADDR_MASK) | leaf_flags;
+}
+
+uint64_t vmm_current_cr3(void) {
+    return read_cr3();
+}
+
+/* Walks pml4_phys down to vaddr's leaf entry without allocating
+ * anything missing (unlike vmm_map_page()) -- a leaf is either a 4KiB
+ * PT entry, or a 2MiB PD entry if PAGE_HUGE is set (the kernel identity
+ * map in vmm_init() uses huge pages; per-process PML4[1] mappings from
+ * vmm_map_page() never do, but a walker needs to handle both to be
+ * correct for any pml4_phys it's given). Returns NULL if any level
+ * isn't present. */
+static pte_t *walk_to_leaf(uint64_t pml4_phys, uint64_t vaddr) {
+    uint64_t pml4_idx = (vaddr >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (vaddr >> 30) & 0x1FF;
+    uint64_t pd_idx = (vaddr >> 21) & 0x1FF;
+    uint64_t pt_idx = (vaddr >> 12) & 0x1FF;
+
+    pte_t *pml4 = (pte_t *)(uintptr_t)pml4_phys;
+    if (!(pml4[pml4_idx] & PAGE_PRESENT)) {
+        return NULL;
+    }
+    pte_t *pdpt = (pte_t *)(uintptr_t)(pml4[pml4_idx] & TABLE_ADDR_MASK);
+    if (!(pdpt[pdpt_idx] & PAGE_PRESENT)) {
+        return NULL;
+    }
+    pte_t *pd = (pte_t *)(uintptr_t)(pdpt[pdpt_idx] & TABLE_ADDR_MASK);
+    if (!(pd[pd_idx] & PAGE_PRESENT)) {
+        return NULL;
+    }
+    if (pd[pd_idx] & PAGE_HUGE) {
+        return &pd[pd_idx];
+    }
+    pte_t *pt = (pte_t *)(uintptr_t)(pd[pd_idx] & TABLE_ADDR_MASK);
+    if (!(pt[pt_idx] & PAGE_PRESENT)) {
+        return NULL;
+    }
+    return &pt[pt_idx];
+}
+
+int vmm_page_present(uint64_t pml4_phys, uint64_t vaddr) {
+    return walk_to_leaf(pml4_phys, vaddr) != NULL;
+}
+
+int vmm_check_range(uint64_t pml4_phys, uint64_t vaddr, uint64_t len, int need_write) {
+    if (len == 0) {
+        return 1;
+    }
+    if (vaddr + len < vaddr) {
+        return 0; /* overflow */
+    }
+
+    uint64_t start = vaddr & ~(uint64_t)(PMM_PAGE_SIZE - 1);
+    uint64_t end = vaddr + len; /* exclusive */
+    for (uint64_t page = start; page < end; page += PMM_PAGE_SIZE) {
+        pte_t *leaf = walk_to_leaf(pml4_phys, page);
+        if (leaf == NULL || !(*leaf & PAGE_USER)) {
+            return 0;
+        }
+        if (need_write && !(*leaf & PAGE_WRITABLE)) {
+            return 0;
+        }
+    }
+    return 1;
 }

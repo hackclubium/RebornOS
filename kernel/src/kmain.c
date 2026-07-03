@@ -17,6 +17,7 @@
 #include "vfs.h"
 #include "keyboard.h"
 #include "process.h"
+#include "minilib.h"
 
 /* Tiny int $0x80 wrappers for the ring-3 demo program below. "+a"(ret)
  * both supplies the syscall number (via ret's initial value) and reads
@@ -39,16 +40,39 @@ static void ring3_program(void) {
     sys_exit(0);
 }
 
+/* Real per-process stacks for these hand-rolled ring3 test programs:
+ * the shared kernel heap (kmalloc()) lives in the low-4GiB identity
+ * map, which vmm_init() deliberately does NOT mark User-accessible
+ * (see vmm.h) -- so a kmalloc'd buffer can no longer serve as a ring3
+ * stack the way it used to. A stack ring3 code can actually write to
+ * has to be a real mapping in the CURRENTLY LOADED address space (see
+ * vmm_current_cr3() -- the scheduler has already switched CR3 to this
+ * thread's own by the time its entry function starts running), built
+ * the same way elf_loader.c builds one for a real loaded program.
+ * Returns the stack's top (highest address, growing down). */
+#define RING3_TEST_STACK_VADDR (PROCESS_PRIVATE_VADDR + PMM_PAGE_SIZE)
+#define RING3_TEST_STACK_PAGES (SCHEDULER_STACK_SIZE / PMM_PAGE_SIZE)
+
+static void *map_ring3_test_stack(void) {
+    uint64_t pml4_phys = vmm_current_cr3();
+    for (uint32_t i = 0; i < RING3_TEST_STACK_PAGES; i++) {
+        void *phys = pmm_alloc_page();
+        if (phys == NULL) {
+            panic("map_ring3_test_stack: out of physical memory");
+        }
+        memset(phys, 0, PMM_PAGE_SIZE);
+        vmm_map_page(pml4_phys, RING3_TEST_STACK_VADDR + (uint64_t)i * PMM_PAGE_SIZE,
+                     (uint64_t)(uintptr_t)phys, VMM_MAP_WRITE);
+    }
+    return (void *)(uintptr_t)(RING3_TEST_STACK_VADDR + (uint64_t)RING3_TEST_STACK_PAGES * PMM_PAGE_SIZE);
+}
+
 /* An ordinary kernel thread whose only job is the one-way trip into
  * ring 3 -- everything after enter_usermode() is dormant until a
  * syscall or interrupt from ring3_program reactivates this thread's
  * kernel stack. */
 static void user_thread_launcher(void) {
-    uint8_t *user_stack = (uint8_t *)kmalloc(SCHEDULER_STACK_SIZE);
-    if (user_stack == NULL) {
-        panic("user_thread_launcher: kmalloc failed for the user stack");
-    }
-    enter_usermode(ring3_program, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
+    enter_usermode(ring3_program, map_ring3_test_stack(), GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
 }
 
 /* Two processes proving real address-space isolation: each repeatedly
@@ -86,19 +110,11 @@ static void process_b_entry(void) {
 }
 
 static void process_a_launcher(void) {
-    uint8_t *user_stack = (uint8_t *)kmalloc(SCHEDULER_STACK_SIZE);
-    if (user_stack == NULL) {
-        panic("process_a_launcher: kmalloc failed for the user stack");
-    }
-    enter_usermode(process_a_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
+    enter_usermode(process_a_entry, map_ring3_test_stack(), GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
 }
 
 static void process_b_launcher(void) {
-    uint8_t *user_stack = (uint8_t *)kmalloc(SCHEDULER_STACK_SIZE);
-    if (user_stack == NULL) {
-        panic("process_b_launcher: kmalloc failed for the user stack");
-    }
-    enter_usermode(process_b_entry, user_stack + SCHEDULER_STACK_SIZE, GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
+    enter_usermode(process_b_entry, map_ring3_test_stack(), GDT_USER_CODE_SEL, GDT_USER_DATA_SEL, 0, NULL);
 }
 
 /* Boots SHELL.ELF (see userland/shell.c) the same way every other
@@ -186,6 +202,21 @@ static void argv_test_thread(void) {
     thread_exit();
 }
 
+/* Proves elf_handle_stack_fault()'s demand-paged stack growth actually
+ * works end to end: STACKTST.ELF (see userland/stacktest.c) recurses
+ * far past the single 4 KiB page the ELF loader maps eagerly, so a
+ * successful exit here only happens if page faults in the stack's
+ * growth region are really being serviced instead of panicking. */
+static volatile int stacktest_ok = 0;
+
+static void stacktest_thread(void) {
+    if (process_spawn_and_wait("STACKTST.ELF", "stack-test") != 0) {
+        panic("stack growth self-test: STACKTST.ELF not found");
+    }
+    stacktest_ok = 1;
+    thread_exit();
+}
+
 static void scheduler_monitor(void) {
     uint64_t spins = 0;
     /* syscall_write_count >= 6: ring3_program's 5 fixed writes plus
@@ -197,13 +228,13 @@ static void scheduler_monitor(void) {
      * two are). */
     while (worker_a_count < 1000 || worker_b_count < 1000 || syscall_write_count < 6 ||
            process_a_ok < 200 || process_b_ok < 200 || exec_wait_ok < 1 ||
-           subdir_test_ok < 1 || argv_test_ok < 1) {
+           subdir_test_ok < 1 || argv_test_ok < 1 || stacktest_ok < 1) {
         spins++;
         if (spins > 4000000000ULL) {
             panic("scheduler/syscall/isolation self-test: no progress "
-                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d)",
+                  "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu exec=%d subdir=%d argv=%d stack=%d)",
                   worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok,
-                  exec_wait_ok, subdir_test_ok, argv_test_ok);
+                  exec_wait_ok, subdir_test_ok, argv_test_ok, stacktest_ok);
         }
     }
     kprintf("TEST MODE: scheduler+syscall+isolation self-test passed "
@@ -236,7 +267,7 @@ void kmain(boot_info_t *info) {
 
     fb_init(&info->framebuffer);
     fb_clear(0x00102030);
-    fb_puts(8, 8, "REBORNOS -- MILESTONE 8: SUBDIRS, ARGS, WRITE", 0xFFFFFFFF, 0x00102030);
+    fb_puts(8, 8, "REBORNOS -- MILESTONE 9: REAL VIRTUAL MEMORY", 0xFFFFFFFF, 0x00102030);
     fb_puts(8, 24, "SERIAL + FRAMEBUFFER ALIVE.", 0xFFA0A0A0, 0x00102030);
 
     kprintf("kmain: boot checks complete\n");
@@ -393,6 +424,7 @@ void kmain(boot_info_t *info) {
     thread_create("exec-wait-test", exec_wait_test_thread);
     thread_create("subdir-test", subdir_test_thread);
     thread_create("argv-test", argv_test_thread);
+    thread_create("stack-test", stacktest_thread);
     boot_shell();
     timer_set_tick_callback(schedule);
     scheduler_start();

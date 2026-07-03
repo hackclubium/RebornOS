@@ -18,7 +18,17 @@
  * meet -- more than enough for the tiny static binaries this milestone
  * loads. Grows down from here. */
 #define ELF_USER_STACK_TOP 0x0000008010000000ULL
-#define ELF_USER_STACK_PAGES 4u /* 16 KiB */
+
+/* Only the topmost page is mapped eagerly (it also holds the argv
+ * blob -- see write_argv_blob() in elf_loader.c); everything below it,
+ * down to ELF_USER_STACK_MAX_PAGES, is demand-paged in by
+ * elf_handle_stack_fault() the first time a program's stack actually
+ * grows that far. A fault below ELF_USER_STACK_MAX_PAGES isn't a
+ * legitimate stack access -- runaway recursion still hits a real,
+ * unrecoverable fault instead of silently consuming unbounded physical
+ * memory. */
+#define ELF_USER_STACK_PAGES 1u
+#define ELF_USER_STACK_MAX_PAGES 64u /* 256 KiB max stack */
 
 /* argc/argv, when requested, get packed into the top of the stack page
  * this loader already allocates -- a handful of short strings plus a
@@ -59,5 +69,17 @@ void elf_load_user_program(const uint8_t *elf_data, uint64_t elf_size, uint64_t 
  * elf_load_user_program(), heap-allocated by the caller -- freed here),
  * drops into ring 3 at its entry point, and never returns. */
 __attribute__((noreturn)) void elf_launch_process(void *arg);
+
+/* Called from idt.c's page-fault handler before it gives up and
+ * panics. Recognizes exactly one recoverable case -- a ring-3,
+ * not-yet-mapped access within the user stack's allowed growth range
+ * (see ELF_USER_STACK_MAX_PAGES) -- and demand-maps a fresh zeroed page
+ * for it, in which case the faulting instruction can simply be
+ * retried. Returns 1 if it handled the fault this way, 0 if the caller
+ * should treat it as a real fault (kernel-mode, a protection violation
+ * rather than a missing page, outside the stack's growth range, or out
+ * of physical memory). `error_code` is the CPU's raw page-fault error
+ * code (see idt.c's interrupt_frame_t). */
+int elf_handle_stack_fault(uint64_t fault_addr, uint64_t error_code, int from_ring3);
 
 #endif /* REBORNOS_ELF_LOADER_H */

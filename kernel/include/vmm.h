@@ -11,11 +11,45 @@
  * a precise W^X split (a 2 MiB page's permissions apply to everything
  * in it, and the kernel image is much smaller than 4 MiB) -- tightening
  * that to page-level granularity is a reasonable future refinement,
- * not required to say the kernel now owns its own address space. */
+ * not required to say the kernel now owns its own address space.
+ *
+ * Only the executable first KERNEL_EXEC_LIMIT bytes are User-accessible
+ * (a narrow carve-out for kmain.c's pre-ELF-loader ring3 test
+ * functions, which run directly out of this region -- see vmm.c);
+ * everything else -- the heap, the page tables themselves, the
+ * framebuffer, all of it -- is ring0-only. Ring 0 can still reach any
+ * of it regardless (the User bit only restricts ring-3 accesses), but
+ * since a ring-3 program's own page tables share this exact mapping
+ * verbatim via PML4[0] (see vmm_create_address_space()), this is what
+ * makes kernel memory genuinely off-limits to user code rather than
+ * just conventionally left alone. */
 void vmm_init(void);
 
 uint64_t vmm_kernel_cr3(void);
 void vmm_load_cr3(uint64_t phys_addr);
+
+/* Returns the CR3 currently loaded -- since a syscall or page fault
+ * never switches address spaces (the CPU just changes privilege
+ * level), this is always the faulting/calling process's own PML4,
+ * cheaply available without any per-thread bookkeeping. */
+uint64_t vmm_current_cr3(void);
+
+/* Real per-process pointer validation: walks the page tables rooted at
+ * pml4_phys and confirms every 4 KiB page covering [vaddr, vaddr+len)
+ * is actually present and user-accessible (and, if need_write, also
+ * writable) -- as opposed to a coarse "is this address in one of a
+ * few known ranges" heuristic. Works for any buffer the process
+ * legitimately has mapped (its own stack, its loaded segments, ...),
+ * not just a handful of hardcoded regions. */
+int vmm_check_range(uint64_t pml4_phys, uint64_t vaddr, uint64_t len, int need_write);
+
+/* True if `vaddr` has a present leaf mapping in pml4_phys's page
+ * tables, without allocating anything missing -- lets a page-fault
+ * handler distinguish "no page here yet, safe to demand-page in" from
+ * "already mapped, this fault means something else" before calling
+ * vmm_map_page() (which would otherwise silently clobber and leak an
+ * existing mapping). */
+int vmm_page_present(uint64_t pml4_phys, uint64_t vaddr);
 
 /* Every process's page tables share PML4[0] verbatim (the low-4GiB
  * kernel/system mapping vmm_init() built -- identical for everyone,

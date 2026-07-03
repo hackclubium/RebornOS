@@ -94,7 +94,7 @@ $(KERNEL_TEST_ELF): $(KERNEL_TEST_OBJS)
 # a matching userland/<name>.c to ship a new program.
 # ---------------------------------------------------------------------
 
-USER_PROGRAMS := init shell echo
+USER_PROGRAMS := init shell echo stacktst
 USER_OBJDIR   := $(BUILD)/userland
 USER_OBJS     := $(addprefix $(USER_OBJDIR)/,$(addsuffix .o,$(USER_PROGRAMS)))
 USER_ELFS     := $(addprefix $(BUILD)/,$(addsuffix .elf,$(USER_PROGRAMS)))
