@@ -38,6 +38,21 @@ static efi_memory_descriptor_t *desc_at(const boot_info_t *info, uint64_t index)
 void pmm_init(const boot_info_t *info) {
     uint64_t descriptor_count = info->memory_map_size / info->memory_map_descriptor_size;
 
+    /* Diagnostic only, chasing a CI-only "out of physical memory" panic
+     * on the very first page-table allocation (kmain.c's vmm_init(),
+     * immediately after this function returns) that doesn't reproduce
+     * locally despite this same function reporting plenty of free
+     * pages right before it happens -- dumping the raw EFI memory map
+     * lets a CI run show exactly what firmware/memory layout it's
+     * actually working with, to compare against a local run's map. */
+    kprintf("pmm: raw EFI memory map (%lu descriptors):\n", descriptor_count);
+    for (uint64_t i = 0; i < descriptor_count; i++) {
+        efi_memory_descriptor_t *d = desc_at(info, i);
+        kprintf("  [%lu] type=%u phys=0x%lx pages=%lu%s\n",
+                i, d->type, d->physical_start, d->number_of_pages,
+                type_is_usable(d->type) ? " (usable)" : "");
+    }
+
     /* Pass 1: find the highest physical address any *usable* descriptor
      * covers, so the bitmap spans exactly the range we might actually
      * allocate from. Deliberately not "every descriptor": firmware
