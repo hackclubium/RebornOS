@@ -28,7 +28,7 @@ rm -f "$BUILD/test-serial.log"
 # vCPU threads for a while can still stretch a normally-instant wait
 # into several real seconds without anything actually being wrong.
 timeout 90 qemu-system-x86_64 \
-    -machine q35 -m 256M -smp 4 \
+    -machine q35 -m 512M -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
     -drive if=pflash,format=raw,file="$BUILD/OVMF_VARS_test.fd" \
     -drive file=fat:16:rw:"$BUILD/esp-test",format=raw \
