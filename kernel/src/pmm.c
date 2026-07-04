@@ -38,21 +38,6 @@ static efi_memory_descriptor_t *desc_at(const boot_info_t *info, uint64_t index)
 void pmm_init(const boot_info_t *info) {
     uint64_t descriptor_count = info->memory_map_size / info->memory_map_descriptor_size;
 
-    /* Diagnostic only, chasing a CI-only "out of physical memory" panic
-     * on the very first page-table allocation (kmain.c's vmm_init(),
-     * immediately after this function returns) that doesn't reproduce
-     * locally despite this same function reporting plenty of free
-     * pages right before it happens -- dumping the raw EFI memory map
-     * lets a CI run show exactly what firmware/memory layout it's
-     * actually working with, to compare against a local run's map. */
-    kprintf("pmm: raw EFI memory map (%lu descriptors):\n", descriptor_count);
-    for (uint64_t i = 0; i < descriptor_count; i++) {
-        efi_memory_descriptor_t *d = desc_at(info, i);
-        kprintf("  [%lu] type=%u phys=0x%lx pages=%lu%s\n",
-                i, d->type, d->physical_start, d->number_of_pages,
-                type_is_usable(d->type) ? " (usable)" : "");
-    }
-
     /* Pass 1: find the highest physical address any *usable* descriptor
      * covers, so the bitmap spans exactly the range we might actually
      * allocate from. Deliberately not "every descriptor": firmware
@@ -124,7 +109,25 @@ void pmm_init(const boot_info_t *info) {
         }
     }
 
-    search_hint = 0;
+    /* Physical page 0 is never handed out, full stop, regardless of
+     * what firmware's memory map says about it. Every allocator here
+     * (this one, and alloc_table() in vmm.c on top of it) uses a
+     * NULL/0 return to mean "allocation failed" -- if address 0 were
+     * ever actually given out, a *successful* allocation there would
+     * be indistinguishable from failure. This used to work by pure
+     * coincidence: whichever usable descriptor Pass 2 picked to host
+     * the bitmap itself often happened to start at 0, incidentally
+     * reserving it. A firmware/memory-map layout where address 0 sits
+     * in its own separate descriptor (observed in CI, never locally)
+     * breaks that coincidence, so vmm_init()'s very first page-table
+     * allocation can land on physical 0 and get misread as failure --
+     * exactly the "out of physical memory" panic this fixes. */
+    if (bitmap_bits > 0 && !bitmap_test(0)) {
+        bitmap_set(0);
+        free_pages--;
+    }
+
+    search_hint = 1;
 
     kprintf("pmm: %lu total pages (%lu MiB), %lu free (%lu MiB), bitmap at 0x%lx (%lu bytes)\n",
             bitmap_bits, (bitmap_bits * PMM_PAGE_SIZE) / (1024 * 1024),
