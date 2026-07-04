@@ -9,6 +9,7 @@
 #include "heap.h"
 #include "panic.h"
 #include "kprintf.h"
+#include "scheduler.h"
 
 #define AP_STACK_SIZE (16u * 1024u)
 #define AP_START_TIMEOUT_SPINS 200000000ULL
@@ -24,10 +25,27 @@ extern volatile uint64_t ap_cr3;
 extern volatile uint64_t ap_stack_top;
 extern volatile uint64_t ap_entry_point;
 
-volatile uint64_t smp_ap_counters[SMP_MAX_CPUS];
 static uint32_t cpu_count = 1;
 static uint8_t apic_ids[SMP_MAX_CPUS];
 static uint32_t apic_id_count;
+
+/* This kernel's own core numbering -- unrelated to ACPI's enumeration
+ * order in apic_ids[]. The BSP is unconditionally index 0 (gdt_init()
+ * and everything else that runs before smp_init() has even executed
+ * needs a stable answer with no lookup possible yet); each AP that
+ * successfully starts gets the next index in start order. Recorded
+ * here (by the BSP, which already knows both values the moment an AP
+ * confirms it's up) so any core can later ask "which index am I"
+ * via smp_current_cpu_index() by matching its own LAPIC ID against
+ * this table, without needing per-CPU storage this kernel doesn't
+ * have. */
+static uint32_t core_apic_ids[SMP_MAX_CPUS];
+
+/* Set by the BSP right before an AP's SIPI, read once by that AP early
+ * in ap_entry() -- safe as a single reused slot for the same reason
+ * ap_cr3/ap_stack_top/ap_entry_point are: bring-up is strictly one AP
+ * at a time. */
+static volatile uint32_t ap_core_index;
 
 /* Bumped by an AP once it's done enough of its own setup to be safely
  * left running while the BSP moves on to starting the next one --
@@ -35,6 +53,12 @@ static uint32_t apic_id_count;
  * coherency alone is enough for this "wait until a flag changes"
  * pattern, no explicit fence needed. */
 static volatile uint32_t ap_started_count;
+
+/* Set once by the BSP, right before its own scheduler_start(), after
+ * every boot-time thread_create() call has already run -- see
+ * smp_signal_scheduler_ready()'s doc comment in smp.h for why an AP
+ * can't just join the instant its own setup is done. */
+static volatile int scheduler_ready;
 
 static void spin_delay(uint64_t iterations) {
     for (uint64_t i = 0; i < iterations; i++) {
@@ -47,29 +71,30 @@ static void spin_delay(uint64_t iterations) {
  * page tables) and running on its own real stack, but still pointed at
  * the trampoline's temporary GDT and whatever garbage IDTR real mode
  * left behind. Finishes bringing this core up to the same footing
- * every kernel thread expects, then proves it's alive by spinning on
- * its own private counter forever -- distributing real scheduled
- * threads across cores is future work. */
+ * every kernel thread expects (its own TSS, its own IDT, its own LAPIC
+ * timer for local preemption), then joins the shared scheduler exactly
+ * the way the BSP does -- scheduler_start() never returns, so nothing
+ * after that call ever runs. */
 void ap_entry(void) {
-    gdt_load_on_this_cpu();
+    uint32_t my_index = ap_core_index; /* set by the BSP right before this AP's SIPI */
+
+    gdt_load_on_this_cpu(my_index);
     idt_load_on_this_cpu();
     lapic_init();
-
-    uint32_t my_apic_id = lapic_id();
-    uint32_t my_index = 0;
-    for (uint32_t i = 0; i < apic_id_count; i++) {
-        if (apic_ids[i] == my_apic_id) {
-            my_index = i;
-            break;
-        }
-    }
+    lapic_timer_start();
 
     __asm__ volatile("" ::: "memory"); /* make sure setup above is visible before we signal readiness */
     __sync_fetch_and_add(&ap_started_count, 1);
 
-    for (;;) {
-        smp_ap_counters[my_index]++;
+    while (!scheduler_ready) {
+        __asm__ volatile("pause");
     }
+    scheduler_start();
+}
+
+void smp_signal_scheduler_ready(void) {
+    __asm__ volatile("" ::: "memory"); /* every thread_create() call above must be visible first */
+    scheduler_ready = 1;
 }
 
 void smp_init(uint64_t rsdp_addr) {
@@ -80,7 +105,13 @@ void smp_init(uint64_t rsdp_addr) {
 
     lapic_init();
     uint32_t bsp_apic_id = lapic_id();
+    core_apic_ids[0] = bsp_apic_id;
     uint32_t sipi_vector = (uint32_t)((uintptr_t)ap_trampoline_start >> 12);
+
+    /* Every core's LAPIC runs off the same bus clock, so this one
+     * measurement (on the BSP, before any AP exists) is all every AP's
+     * later lapic_timer_start() call needs. */
+    lapic_calibrate_timer();
 
     for (uint32_t i = 0; i < apic_id_count; i++) {
         if (apic_ids[i] == bsp_apic_id) {
@@ -95,6 +126,7 @@ void smp_init(uint64_t rsdp_addr) {
         ap_cr3 = vmm_kernel_cr3();
         ap_stack_top = (uint64_t)(uintptr_t)stack + AP_STACK_SIZE;
         ap_entry_point = (uint64_t)(uintptr_t)ap_entry;
+        ap_core_index = cpu_count; /* the index this AP will get if it comes up */
 
         uint32_t before = ap_started_count;
 
@@ -118,6 +150,7 @@ void smp_init(uint64_t rsdp_addr) {
             __asm__ volatile("pause");
         }
         if (ap_started_count != before) {
+            core_apic_ids[cpu_count] = apic_ids[i];
             cpu_count++;
         }
     }
@@ -127,4 +160,14 @@ void smp_init(uint64_t rsdp_addr) {
 
 uint32_t smp_cpu_count(void) {
     return cpu_count;
+}
+
+uint32_t smp_current_cpu_index(void) {
+    uint32_t id = lapic_id();
+    for (uint32_t i = 0; i < cpu_count; i++) {
+        if (core_apic_ids[i] == id) {
+            return i;
+        }
+    }
+    return 0; /* BSP fallback: called before smp_init() has run, or genuinely single-core */
 }

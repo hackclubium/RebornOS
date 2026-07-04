@@ -5,6 +5,8 @@
 #include "elf_loader.h"
 #include "scheduler.h"
 #include "kprintf.h"
+#include "lapic.h"
+#include "smp.h"
 
 extern uint64_t isr_stub_table[IDT_VECTOR_COUNT];
 extern void isr_stub_128(void); /* int $0x80 -- registered directly, not part of isr_stub_table */
@@ -77,6 +79,13 @@ static const char *exception_name(uint64_t vector) {
 
 static void exception_handler(interrupt_frame_t *frame) {
     int from_ring3 = (frame->cs & 0x3) == 3;
+    /* Diagnostic only: which physical core and which of our own thread
+     * records was executing when this fault happened. rip/error_code
+     * alone don't say that, and it matters a lot for telling apart "the
+     * BSP's PIT-driven schedule() path" from "an AP's LAPIC-driven
+     * one" while chasing an intermittent, core-dependent bug. */
+    uint32_t core = smp_current_cpu_index();
+    const char *tname = thread_current_name();
 
     if (frame->vector == 14) {
         uint64_t fault_addr = read_cr2();
@@ -85,12 +94,14 @@ static void exception_handler(interrupt_frame_t *frame) {
         }
         if (from_ring3) {
             kprintf("fault: process killed by page fault at rip=0x%lx, error_code=0x%lx, "
-                    "fault address (cr2)=0x%lx\n",
-                    frame->rip, frame->error_code, fault_addr);
+                    "fault address (cr2)=0x%lx, core=%u, thread=\"%s\"\n",
+                    frame->rip, frame->error_code, fault_addr, core, tname);
             thread_exit_code(FAULT_EXIT_CODE(frame->vector));
         }
-        panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx, fault address (cr2)=0x%lx",
-              frame->vector, exception_name(frame->vector), frame->rip, frame->error_code, fault_addr);
+        panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx, fault address (cr2)=0x%lx, "
+              "core=%u, thread=\"%s\"",
+              frame->vector, exception_name(frame->vector), frame->rip, frame->error_code, fault_addr,
+              core, tname);
     }
 
     /* Any other exception from ring 3 (invalid opcode, GPF, divide
@@ -98,13 +109,32 @@ static void exception_handler(interrupt_frame_t *frame) {
      * an exception taken from ring 0 is our own bug, and stays fatal
      * so it's never silently swallowed. */
     if (from_ring3) {
-        kprintf("fault: process killed by CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx\n",
-                frame->vector, exception_name(frame->vector), frame->rip, frame->error_code);
+        kprintf("fault: process killed by CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx, "
+                "core=%u, thread=\"%s\"\n",
+                frame->vector, exception_name(frame->vector), frame->rip, frame->error_code, core, tname);
         thread_exit_code(FAULT_EXIT_CODE(frame->vector));
     }
 
-    panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx",
-          frame->vector, exception_name(frame->vector), frame->rip, frame->error_code);
+    /* Diagnostic only, chasing an intermittent ring-0 rip=0 crash: dump
+     * a window of stack memory around the interrupted context's own
+     * rbp (captured by isr_common_stub before anything in the C
+     * dispatch chain touches it) to tell apart "one corrupted return
+     * address" from "this whole region reads as zero", which would
+     * point at some memset() landing on a live kernel stack instead of
+     * its intended freshly allocated page. 8-byte-aligned, non-NULL
+     * check only: this is already a fatal path, so a bad read here just
+     * produces a second, still-informative fault. */
+    if (frame->rbp != 0 && (frame->rbp & 0x7) == 0) {
+        uint64_t *p = (uint64_t *)(uintptr_t)frame->rbp;
+        kprintf("diag: rbp=0x%lx stack window [rbp-32..rbp+32]: "
+                "%lx %lx %lx %lx %lx %lx %lx %lx %lx\n",
+                frame->rbp, p[-4], p[-3], p[-2], p[-1], p[0], p[1], p[2], p[3], p[4]);
+    } else {
+        kprintf("diag: rbp=0x%lx (NULL or misaligned -- skipping stack window dump)\n", frame->rbp);
+    }
+
+    panic("CPU exception %lu (%s) at rip=0x%lx, error_code=0x%lx, core=%u, thread=\"%s\"",
+          frame->vector, exception_name(frame->vector), frame->rip, frame->error_code, core, tname);
 }
 
 /* IRQs (vector >= 32) are wired up by individual device drivers
@@ -128,6 +158,10 @@ void interrupt_dispatch(interrupt_frame_t *frame) {
     }
     if (frame->vector == SYSCALL_VECTOR) {
         syscall_dispatch(frame);
+        return;
+    }
+    if (frame->vector == LAPIC_TIMER_VECTOR) {
+        lapic_timer_isr(frame);
         return;
     }
     if (frame->vector >= 32 && frame->vector < 32 + IRQ_HANDLER_COUNT) {

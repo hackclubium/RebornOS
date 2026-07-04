@@ -145,9 +145,18 @@ static void boot_shell(void) {
 static volatile uint64_t worker_a_count = 0;
 static volatile uint64_t worker_b_count = 0;
 
+/* Which core index (see smp_current_cpu_index()) has actually executed
+ * one of these two threads' loop bodies, and how many times -- see
+ * smp_test_thread() below. Threads aren't pinned to a core (running_on_core
+ * in scheduler.c), so with real cross-core scheduling working, worker_a
+ * and worker_b naturally drift across every core over enough
+ * preemptions regardless of which core happens to grab them first. */
+static volatile uint64_t core_progress[SMP_MAX_CPUS];
+
 static void worker_a(void) {
     for (;;) {
         worker_a_count++;
+        core_progress[smp_current_cpu_index()]++;
         __asm__ volatile("pause");
     }
 }
@@ -155,6 +164,7 @@ static void worker_a(void) {
 static void worker_b(void) {
     for (;;) {
         worker_b_count++;
+        core_progress[smp_current_cpu_index()]++;
         __asm__ volatile("pause");
     }
 }
@@ -241,14 +251,15 @@ static void network_test_thread(void) {
     thread_exit();
 }
 
-/* Proves other CPU cores are genuinely executing in parallel with the
- * BSP, not just that smp_init() thought it started them: every core
- * smp.c brought up increments only its own private slot in
- * smp_ap_counters[] forever, so this only passes if at least
- * (smp_cpu_count() - 1) distinct slots are actually moving. The BSP's
- * own slot is never written by anyone (see ap_entry() in smp.c), so it
- * naturally never counts towards "progressed" without needing to know
- * which array index belongs to which core. */
+/* Proves real cross-core *thread scheduling*, not just that other
+ * cores came up alive: before this milestone, every AP just spun
+ * incrementing its own private counter forever, proving nothing more
+ * than "the core executes instructions." Now every core (BSP and every
+ * AP) runs the exact same shared scheduler, pulling threads off one
+ * common ready queue -- this only passes once core_progress[] shows
+ * every one of smp_cpu_count()'s cores has actually run real scheduled
+ * thread code (worker_a/worker_b, most likely, since they never block
+ * or exit), not merely that smp_init() believed it started them. */
 static volatile int smp_test_ok = 0;
 
 static void smp_test_thread(void) {
@@ -260,17 +271,17 @@ static void smp_test_thread(void) {
     uint64_t spins = 0;
     for (;;) {
         uint32_t progressed = 0;
-        for (uint32_t i = 0; i < SMP_MAX_CPUS; i++) {
-            if (smp_ap_counters[i] > 1000) {
+        for (uint32_t i = 0; i < total_cores; i++) {
+            if (core_progress[i] > 1000) {
                 progressed++;
             }
         }
-        if (progressed >= total_cores - 1) {
+        if (progressed >= total_cores) {
             break;
         }
         spins++;
         if (spins > 4000000000ULL) {
-            panic("smp self-test: not every started core made progress (cores=%u progressed=%u)",
+            panic("smp self-test: not every core ran real scheduled thread code (cores=%u progressed=%u)",
                   total_cores, progressed);
         }
         schedule();
@@ -361,12 +372,6 @@ static void scheduler_monitor(void) {
             "(a=%lu b=%lu syscalls=%lu proc_a=%lu proc_b=%lu)\n",
             worker_a_count, worker_b_count, syscall_write_count, process_a_ok, process_b_ok);
     qemu_debug_exit(QEMU_DEBUG_EXIT_SUCCESS);
-}
-#else
-static void idle_thread(void) {
-    for (;;) {
-        __asm__ volatile("hlt");
-    }
 }
 #endif
 
@@ -539,6 +544,7 @@ void kmain(boot_info_t *info) {
 
     kprintf("TEST MODE: starting scheduler+syscall+isolation self-test\n");
     scheduler_init();
+    scheduler_create_idle_threads(smp_cpu_count());
     thread_create("worker-a", worker_a);
     thread_create("worker-b", worker_b);
     thread_create("monitor", scheduler_monitor);
@@ -555,6 +561,7 @@ void kmain(boot_info_t *info) {
     thread_create("crash-test", crashtest_thread);
     boot_shell();
     timer_set_tick_callback(schedule);
+    smp_signal_scheduler_ready(); /* every AP is waiting on this before joining -- see smp.h */
     scheduler_start();
     panic("kmain: scheduler_start returned -- unreachable");
 #else
@@ -566,12 +573,13 @@ void kmain(boot_info_t *info) {
 
     kprintf("kmain: starting scheduler\n");
     scheduler_init();
-    thread_create("idle", idle_thread);
+    scheduler_create_idle_threads(smp_cpu_count());
     thread_create("user", user_thread_launcher);
     thread_create_process("process-a", process_a_launcher, vmm_create_address_space());
     thread_create_process("process-b", process_b_launcher, vmm_create_address_space());
     boot_shell();
     timer_set_tick_callback(schedule);
+    smp_signal_scheduler_ready(); /* every AP is waiting on this before joining -- see smp.h */
     scheduler_start();
     panic("kmain: scheduler_start returned -- unreachable");
 #endif

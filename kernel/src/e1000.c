@@ -4,6 +4,8 @@
 #include "pmm.h"
 #include "panic.h"
 #include "minilib.h"
+#include "interrupts.h"
+#include "spinlock.h"
 
 #define E1000_CLASS 0x02u    /* network controller */
 #define E1000_SUBCLASS 0x00u /* ethernet controller */
@@ -199,10 +201,27 @@ void e1000_get_mac(uint8_t mac_out[6]) {
     memcpy(mac_out, mac, 6);
 }
 
+/* tx_tail/rx_tail and the descriptor rings are shared global state
+ * with no per-thread copies -- same hazard as ahci.c's single command
+ * slot, and the same fix: a lock around each ring's own tail-advancing
+ * sequence, since two cores both calling e1000_send() (or both calling
+ * e1000_poll_receive()) at once would otherwise race to claim the same
+ * descriptor slot and corrupt each other's bookkeeping. cli isn't
+ * needed here in addition to the lock for e1000_poll_receive() (it
+ * never blocks), but e1000_send()'s poll loop can spin for a while, so
+ * it keeps the same irq_save_disable()/lock pairing as ahci.c/heap.c
+ * to stay consistent with how every other shared-hardware-state
+ * section in this kernel is protected. */
+static spinlock_t e1000_tx_lock = SPINLOCK_INIT;
+static spinlock_t e1000_rx_lock = SPINLOCK_INIT;
+
 void e1000_send(const void *frame, uint16_t len) {
     if (len > E1000_BUF_SIZE) {
         panic("e1000_send: frame too large (%u bytes, max %u)", (unsigned)len, E1000_BUF_SIZE);
     }
+
+    uint64_t flags = irq_save_disable();
+    spinlock_acquire(&e1000_tx_lock);
 
     volatile e1000_tx_desc_t *desc = &tx_ring[tx_tail];
     memcpy((void *)(uintptr_t)desc->addr, frame, len);
@@ -221,11 +240,19 @@ void e1000_send(const void *frame, uint16_t len) {
             panic("e1000_send: card never reported the frame as sent");
         }
     }
+
+    spinlock_release(&e1000_tx_lock);
+    irq_restore(flags);
 }
 
 uint16_t e1000_poll_receive(void *buf, uint16_t max_len) {
+    uint64_t flags = irq_save_disable();
+    spinlock_acquire(&e1000_rx_lock);
+
     volatile e1000_rx_desc_t *desc = &rx_ring[(rx_tail + 1) % RX_DESC_COUNT];
     if (!(desc->status & DESC_STATUS_DD)) {
+        spinlock_release(&e1000_rx_lock);
+        irq_restore(flags);
         return 0; /* nothing new */
     }
 
@@ -237,5 +264,7 @@ uint16_t e1000_poll_receive(void *buf, uint16_t max_len) {
     rx_tail = (rx_tail + 1) % RX_DESC_COUNT;
     reg_write(REG_RDT, rx_tail);
 
+    spinlock_release(&e1000_rx_lock);
+    irq_restore(flags);
     return len;
 }

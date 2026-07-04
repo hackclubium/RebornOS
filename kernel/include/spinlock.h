@@ -11,11 +11,12 @@
  * executing simultaneously, cli on core 0 does nothing to stop core 1
  * from running the exact same code at the exact same time, so a real
  * cross-core lock is needed wherever more than one core can reach the
- * same shared state. This first lock protects the shared serial port
- * (see kprintf.c/serial.c) -- e1000.c, heap.c, pmm.c, and friends stay
- * single-core-only for this milestone (only the BSP runs scheduled
- * threads; the APs just spin incrementing their own private counters),
- * so they don't need one yet. */
+ * same shared state. Used for the shared serial port (see
+ * kprintf.c/serial.c) and, since real scheduled threads now run on
+ * every core (see scheduler.c), every other previously single-core-only
+ * critical section too: kmalloc/kfree (heap.c), the page bitmap
+ * (pmm.c), ahci.c's command slot, e1000.c's tx/rx paths, and vfs.c's
+ * FAT16 operations. */
 typedef struct {
     volatile uint32_t locked;
 } spinlock_t;

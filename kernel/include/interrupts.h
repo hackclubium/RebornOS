@@ -16,7 +16,7 @@ typedef struct {
     uint64_t rip, cs, rflags;
 } interrupt_frame_t;
 
-#define IDT_VECTOR_COUNT 48 /* CPU exceptions 0-31, IRQ0-15 (timer, keyboard, mouse, ...) = 32-47 */
+#define IDT_VECTOR_COUNT 49 /* CPU exceptions 0-31, IRQ0-15 (timer, keyboard, mouse, ...) = 32-47, LAPIC timer = 48 */
 
 /* Protects a short critical section against the preemptive scheduler
  * (timer_set_tick_callback(schedule) in kmain.c means a timer IRQ can

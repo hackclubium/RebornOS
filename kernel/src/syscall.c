@@ -113,16 +113,17 @@ void syscall_dispatch(interrupt_frame_t *frame) {
             }
             char **user_argv = (char **)(uintptr_t)frame->rdi;
 
-            /* Safe as plain statics despite this call blocking (via
-             * process_spawn_args_and_wait()) until the child exits,
-             * even though another thread could issue its own SYS_EXEC
-             * during that wait and reuse these buffers: the strings are
-             * only needed long enough for elf_load_user_program() to
-             * copy them into the *child's own* stack memory, which
-             * happens synchronously before the wait loop below ever
-             * starts, not on every loop iteration. */
-            static char arg_storage[SYS_EXEC_MAX_ARGS][SYS_EXEC_MAX_ARG_LEN];
-            static char *argv[SYS_EXEC_MAX_ARGS];
+            /* Plain (non-static) locals, each on this syscall's own
+             * caller's kernel stack: with real cross-core scheduling,
+             * two threads on two different cores can now genuinely
+             * execute SYS_EXEC's argument-copying step at the exact
+             * same instant, which a single shared static buffer can't
+             * survive (unlike the single-core-only case this used to
+             * be, where only one thread's syscall handler ever actually
+             * executed at a time). ~2.2KB combined, comfortably inside
+             * SCHEDULER_STACK_SIZE's 16KB per-thread kernel stack. */
+            char arg_storage[SYS_EXEC_MAX_ARGS][SYS_EXEC_MAX_ARG_LEN];
+            char *argv[SYS_EXEC_MAX_ARGS];
             for (int64_t i = 0; i < argc; i++) {
                 copy_user_string((uint64_t)(uintptr_t)user_argv[i], "SYS_EXEC argv[i]",
                                   arg_storage[i], SYS_EXEC_MAX_ARG_LEN);

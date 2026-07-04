@@ -1,0 +1,62 @@
+name: Release
+
+# Building a bootable image only on an actual version tag (v1.2.3-style)
+# keeps this separate from ci.yml's on-every-push smoke test: CI answers
+# "does it still boot", this answers "here's a downloadable image for
+# this specific version".
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bison flex libgmp-dev libmpc-dev libmpfr-dev \
+              texinfo libisl-dev qemu-system-x86 ovmf gcc-mingw-w64-x86-64
+
+      # Same cache key as ci.yml so a tag pushed right after a green CI
+      # run on the same commit reuses that build instead of paying the
+      # 20-40 minute from-source cross-compiler build again.
+      - name: Cache cross-compiler
+        id: cross-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/cross
+          key: cross-gcc-${{ runner.os }}-${{ hashFiles('toolchain/build-cross-gcc.sh') }}
+
+      - name: Build cross-compiler
+        if: steps.cross-cache.outputs.cache-hit != 'true'
+        run: make toolchain
+
+      - name: Verify boot before releasing anything
+        run: make test
+
+      - name: Build release image
+        run: make image
+
+      # build/esp is a staged EFI System Partition directory (see
+      # tools/mkimage.sh), not a single disk image file -- QEMU boots it
+      # directly via the VVFAT driver, so that same directory layout is
+      # exactly what real UEFI firmware expects on a FAT-formatted USB
+      # stick or disk partition too. Zipping it up as-is is the release
+      # artifact; no separate disk-image tool needed.
+      - name: Package the ESP
+        run: |
+          cd build/esp
+          zip -r "../../RebornOS-${GITHUB_REF_NAME}.zip" .
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "RebornOS ${{ github.ref_name }}"
+          files: RebornOS-${{ github.ref_name }}.zip
+          generate_release_notes: true

@@ -5,6 +5,7 @@
 #include "panic.h"
 #include "minilib.h"
 #include "interrupts.h"
+#include "spinlock.h"
 
 /* A minimal polled (no interrupts) AHCI driver: enough to find the
  * boot disk and issue READ/WRITE DMA EXT commands on a single command
@@ -224,14 +225,23 @@ void blockdev_init(void) {
  * own request finished, and the caller silently gets someone else's
  * data with no error ever raised. irq_save_disable()/irq_restore()
  * make the whole setup-issue-poll-check sequence atomic with respect
- * to preemption, and nest correctly if ever called from within
- * another already-cli'd critical section. */
+ * to same-core preemption, and nest correctly if ever called from
+ * within another already-cli'd critical section -- ahci_lock covers
+ * the same hazard across cores now that real scheduled threads can run
+ * on more than one at once. This also happens to be exactly correct
+ * for the hardware, not just a software workaround: this driver only
+ * ever programs the HBA's single command slot, so two operations
+ * genuinely cannot be in flight at the same time regardless of how
+ * many cores ask for one. */
+static spinlock_t ahci_lock = SPINLOCK_INIT;
+
 static void issue_rw_command(uint64_t lba, uint32_t count, void *buf, int is_write) {
     if (count == 0) {
         return;
     }
 
     uint64_t irq_flags = irq_save_disable();
+    spinlock_acquire(&ahci_lock);
 
     fis_reg_h2d_t *fis = (fis_reg_h2d_t *)cmd_table->cfis;
     memset(fis, 0, sizeof(*fis));
@@ -272,6 +282,7 @@ static void issue_rw_command(uint64_t lba, uint32_t count, void *buf, int is_wri
               lba, count, is_write, (uint64_t)tfd);
     }
 
+    spinlock_release(&ahci_lock);
     irq_restore(irq_flags);
 }
 

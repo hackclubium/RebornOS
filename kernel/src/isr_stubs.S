@@ -85,8 +85,15 @@ ISR_NOERR 45
 ISR_NOERR 46
 ISR_NOERR 47
 
+/* Vector 48: the LAPIC periodic timer every AP starts (see
+ * lapic_timer_start() in lapic.c) -- outside the legacy IRQ range
+ * above since it needs a LAPIC EOI, not a PIC one; idt.c's
+ * interrupt_dispatch() special-cases it directly to lapic_timer_isr()
+ * rather than routing it through irq_handlers[]. */
+ISR_NOERR 48
+
 /* Syscall vector (int $0x80). Deliberately NOT added to isr_stub_table
- * below (that table is sized/indexed for vectors 0-32 only) -- idt.c
+ * below (that table is sized/indexed for vectors 0-48 only) -- idt.c
  * registers this one directly by name, with a DPL=3 gate so user mode
  * is actually allowed to execute `int $0x80` without a #GP. */
 ISR_NOERR 128
@@ -183,3 +190,4 @@ isr_stub_table:
     .quad isr_stub_45
     .quad isr_stub_46
     .quad isr_stub_47
+    .quad isr_stub_48

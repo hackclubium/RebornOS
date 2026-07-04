@@ -71,6 +71,11 @@ __attribute__((noreturn)) void thread_exit_code(int64_t code);
  * on this and schedule() -- no separate wait queue needed. */
 int thread_is_alive(int tid);
 
+/* Diagnostic only: current_thread[]'s name for the calling core, or
+ * "(none)" if this core hasn't picked one up yet -- see idt.c's
+ * exception_handler(). */
+const char *thread_current_name(void);
+
 /* The currently-running thread's SYS_SBRK break (see syscall.c) --
  * every thread gets one (initialized to USER_HEAP_VADDR_START when
  * created), even though only ring-3 processes ever actually call
@@ -81,5 +86,16 @@ void thread_set_heap_brk(uint64_t brk);
 /* Switches from the caller's context into the first thread and never
  * returns. Call once, after creating at least one thread. */
 __attribute__((noreturn)) void scheduler_start(void);
+
+/* Creates one dedicated idle thread per core (0..cpu_count-1) that
+ * schedule()/scheduler_start() fall back to when a core has nothing
+ * else ready to run -- must be called once, after scheduler_init()
+ * and before smp_signal_scheduler_ready() (i.e. before any AP can
+ * possibly need one). Without this, a core whose own thread just
+ * exited could find every *other* active thread genuinely running,
+ * uninterrupted, on some other core, with nothing to switch to and no
+ * guarantee anything ever frees up -- a real livelock, not just a
+ * missed optimization. */
+void scheduler_create_idle_threads(uint32_t cpu_count);
 
 #endif /* REBORNOS_SCHEDULER_H */
