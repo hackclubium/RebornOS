@@ -23,6 +23,7 @@
 #include "smp.h"
 #include "mouse.h"
 
+#ifdef REBORNOS_TEST_MODE
 /* Tiny int $0x80 wrappers for the ring-3 demo program below. "+a"(ret)
  * both supplies the syscall number (via ret's initial value) and reads
  * back the kernel's return value from the same register afterward. */
@@ -132,6 +133,7 @@ static void boot_shell(void) {
         panic("kmain: SHELL.ELF not found on the ESP");
     }
 }
+#endif
 
 #ifdef REBORNOS_TEST_MODE
 /* Two worker threads that just count, plus a monitor thread that waits
@@ -375,6 +377,14 @@ static void scheduler_monitor(void) {
 }
 #endif
 
+#ifndef REBORNOS_TEST_MODE
+static void boot_desktop(void) {
+    if (process_spawn("DESKTOP.ELF", "desktop") < 0) {
+        panic("kmain: DESKTOP.ELF not found on the ESP");
+    }
+}
+#endif
+
 void kmain(boot_info_t *info) {
     serial_init();
     kprintf("RebornOS kernel: serial online\n");
@@ -574,10 +584,7 @@ void kmain(boot_info_t *info) {
     kprintf("kmain: starting scheduler\n");
     scheduler_init();
     scheduler_create_idle_threads(smp_cpu_count());
-    thread_create("user", user_thread_launcher);
-    thread_create_process("process-a", process_a_launcher, vmm_create_address_space());
-    thread_create_process("process-b", process_b_launcher, vmm_create_address_space());
-    boot_shell();
+    boot_desktop();
     timer_set_tick_callback(schedule);
     smp_signal_scheduler_ready(); /* every AP is waiting on this before joining -- see smp.h */
     scheduler_start();
